@@ -1,5 +1,11 @@
 # Optimization-Based Beam Selection for SINR, Spectral Efficiency and Energy Efficiency in 6G Massive MIMO Systems
 
+## 📁 Project Drive Folder
+
+📎 [Project Drive Folder — Datasets, Results & Documents](https://drive.google.com/drive/folders/1g1j3vRdJsSh5KAm-Jqj7oOJR_bh--43b?usp=sharing)
+
+---
+
 ## 📌 Project Overview
 
 This project focuses on **beam selection and beam-to-RF-chain assignment** in a multi-user 6G massive MIMO system.
