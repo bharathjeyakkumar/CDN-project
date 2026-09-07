@@ -31,10 +31,9 @@ The planned GitHub repository is organized as follows:
 │
 ├── README.md
 │
+├── architecture/
+│   
 ├── references/
-│   ├── papers/
-│   ├── review1/
-│   └── other_reference_material/
 │
 ├── codes/
 │   ├── channel_model/
