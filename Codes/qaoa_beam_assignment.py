@@ -1,22 +1,24 @@
 """
-QAOA (XY mixer) beam-to-RF-chain assignment, compared against Greedy, OMP
-and the exact optimum, with RF-chain mapping, gain / SINR / SE / EE,
-fairness and interference analysis.
+XY-mixer QAOA beam-to-RF-chain assignment compared with Greedy, OMP and the
+exact optimum, with RF-chain mapping, gain / SINR / SE / EE, fairness and
+interference analysis.
 
-Pipeline per seed
------------------
-1. Generate the stress scenario, build the gain matrix G[k, m] = |h_k . f_m|^2
-2. Reduce to a subproblem: K_SUB users (most crowded hotspot first) x
-   M_CAND best beams per user, served by N_RF_SUB RF chains
-3. Encode as QUBO (one-hot group per user: M_CAND beams + 1 idle slot),
-   convert to Ising (Eqs. 10-12), unit-test the conversion
-4. Simulate XY-mixer QAOA exactly inside the feasible (one-hot) subspace
-5. Measure, keep the lowest-energy feasible bitstring, assign each chosen
-   beam to an RF chain (analog precoder F_RF)
-6. Evaluate all methods with the SAME metrics and produce 3 figures:
-      qaoa_results.png       gain / SINR / SE / EE
-      qaoa_fairness.png      per-user SE histogram + Jain's index
-      qaoa_interference.png  interference power, SIR histogram, leakage map
+BACKEND = "circuit"      gate-level Qiskit circuit (qaoa_circuit.py):
+                         W-state preparation, RZ/RZZ cost layer, RXX/RYY XY mixer.
+                         Limited to ~20 qubits (K_SUB * (M_CAND + 1)).
+BACKEND = "statevector"  exact NumPy simulation inside the one-hot subspace.
+                         Larger subproblems, no gate decomposition.
+
+In both backends the cost Hamiltonian comes from the QUBO -> Ising mapping
+of Eqs. (10)-(12); the mapping is verified numerically on random bit strings,
+on every feasible-subspace state, and (circuit backend) against the Pauli
+operator that is compiled into the circuit.
+
+Figures written:
+    qaoa_results_<backend>.png        gain / SINR / SE / EE
+    qaoa_fairness_<backend>.png       per-user SE histogram, Jain index, worst user
+    qaoa_interference_<backend>.png   interference, SIR histogram, leakage map
+    qaoa_circuit_<backend>.png        drawing of the parametrised circuit (circuit backend)
 """
 
 import itertools
@@ -36,6 +38,9 @@ from compute_sinr import compute_sinr_for_assignment
 # PARAMETERS
 # ======================================================
 
+BACKEND = "circuit"            # "circuit" or "statevector"
+USE_AER_SAMPLING = True        # circuit backend: sample final shots with Qiskit Aer if installed
+
 N_ANTENNAS = 16
 N_USERS = 20
 OVERSAMPLING = 1
@@ -43,9 +48,14 @@ N_HOTSPOTS = 3
 HOTSPOT_SPREAD_DEG = 3.0
 
 # subproblem solved by QAOA / Greedy / OMP / Optimal
-K_SUB = 6          # users in the subproblem
-M_CAND = 3         # candidate beams per user
-N_RF_SUB = 3       # RF chains in the subproblem
+if BACKEND == "circuit":
+    K_SUB, M_CAND, N_RF_SUB = 4, 2, 2      # 4 users x (2 beams + idle) = 12 qubits
+    MIXER = "trotter"                      # the circuit is a Trotterised XY mixer
+    N_RESTARTS, MAXITER = 4, 200
+else:
+    K_SUB, M_CAND, N_RF_SUB = 6, 3, 3      # 6 x (3 + 1) = 24 qubits-equivalent subspace
+    MIXER = "exact"                        # "exact" = expm of XY Hamiltonian, or "trotter"
+    N_RESTARTS, MAXITER = 6, 300
 
 # QUBO weights (gains are normalised to max 1)
 MU = 1.0           # interference weight
@@ -54,8 +64,6 @@ LAM_C = 2.0        # "exactly N_RF_SUB served users" penalty
 
 # QAOA
 P_DEPTH = 2
-N_RESTARTS = 6
-MAXITER = 300
 SHOTS = 4096
 
 # power / noise (same as run_greedy_review)
@@ -130,16 +138,16 @@ def build_qubo(Gn, users, cand):
 
 
 def ising_from_qubo(Q):
-    """h, J, c from Eqs. (10)-(12), using x = (1 - s) / 2."""
+    """h, J, c from Eqs. (10)-(12), using x = (1 - s) / 2 (s = +1 <-> |0>)."""
     N = len(Q)
-    h = -0.5 * Q.sum(1)
+    h = np.array([-0.5 * (Q[i, i] + sum(Q[i, j] for j in range(N) if j != i))
+                  for i in range(N)])
     J = {(i, j): 0.5 * Q[i, j] for i in range(N) for j in range(i + 1, N)}
     c = 0.5 * np.trace(Q) + 0.5 * np.triu(Q, 1).sum()
     return h, J, c
 
 
-def check_ising(Q, trials=20):
-    h, J, c = ising_from_qubo(Q)
+def check_ising_random(Q, h, J, c, trials=20):
     rng = np.random.default_rng(0)
     for _ in range(trials):
         x = rng.integers(0, 2, len(Q))
@@ -149,8 +157,20 @@ def check_ising(Q, trials=20):
         assert np.isclose(e_q, e_i), (e_q, e_i)
 
 
+def ising_energies_subspace(h, J, c, offset, states, K, S):
+    """Ising energy of every one-hot state, to compare with the QUBO energy."""
+    X = np.zeros((len(states), K * S))
+    for k in range(K):
+        X[np.arange(len(states)), k * S + states[:, k]] = 1
+    s = 1 - 2 * X
+    Jm = np.zeros((K * S, K * S))
+    for (i, j), v in J.items():
+        Jm[i, j] = v
+    return s @ h + np.einsum("ni,ij,nj->n", s, Jm, s) + c + offset
+
+
 # ======================================================
-# 3. FEASIBLE-SUBSPACE QAOA SIMULATION
+# 3. FEASIBLE-SUBSPACE STATEVECTOR SIMULATION (NumPy)
 # ======================================================
 
 def subspace_energies(Q, offset, K, S):
@@ -162,10 +182,27 @@ def subspace_energies(Q, offset, K, S):
     return states, E
 
 
-def mixer_adjacency(S):
-    """XY mixer restricted to the one-hot sector = complete-graph adjacency."""
-    A = np.ones((S, S)) - np.eye(S)
-    return A
+def xy_pairs(S):
+    """Must match qaoa_circuit.xy_pairs: fixed pair order of the XY mixer."""
+    return list(itertools.combinations(range(S), 2))
+
+
+def group_mixer(S, beta, mixer):
+    """
+    XY mixer restricted to the one-hot sector of one group (S x S matrix).
+    exact   : exp(-i beta A), A = complete-graph adjacency
+    trotter : product over pairs of exp(-i beta (|a><b| + |b><a|)), the same
+              ordered product the RXX/RYY gates implement in the circuit.
+    """
+    if mixer == "exact":
+        A = np.ones((S, S)) - np.eye(S)
+        return expm(-1j * beta * A)
+    U = np.eye(S, dtype=complex)
+    for a, b in xy_pairs(S):
+        e = np.zeros((S, S))
+        e[a, b] = e[b, a] = 1
+        U = expm(-1j * beta * e) @ U
+    return U
 
 
 def apply_mixer(psi, U, K, S):
@@ -175,21 +212,19 @@ def apply_mixer(psi, U, K, S):
     return psi.reshape(-1)
 
 
-def qaoa_state(params, E, A, K, S):
+def qaoa_state(params, E, K, S, mixer):
     p = len(params) // 2
     gam, bet = params[:p], params[p:]
     psi = np.ones(S ** K, dtype=complex) / np.sqrt(S ** K)   # product of W states
     for l in range(p):
         psi = psi * np.exp(-1j * gam[l] * E)                  # U_C
-        psi = apply_mixer(psi, expm(-1j * bet[l] * A), K, S)  # U_M (XY)
+        psi = apply_mixer(psi, group_mixer(S, bet[l], mixer), K, S)
     return psi
 
 
-def run_qaoa(E, K, S, p, restarts, rng):
-    A = mixer_adjacency(S)
-
+def run_qaoa_statevector(E, K, S, p, restarts, rng):
     def f(th):
-        return float(np.sum(np.abs(qaoa_state(th, E, A, K, S)) ** 2 * E))
+        return float(np.sum(np.abs(qaoa_state(th, E, K, S, MIXER)) ** 2 * E))
 
     best = None
     for _ in range(restarts):
@@ -198,7 +233,7 @@ def run_qaoa(E, K, S, p, restarts, rng):
         res = minimize(f, th0, method="COBYLA", options={"maxiter": MAXITER})
         if best is None or res.fun < best.fun:
             best = res
-    prob = np.abs(qaoa_state(best.x, E, A, K, S)) ** 2
+    prob = np.abs(qaoa_state(best.x, E, K, S, MIXER)) ** 2
     return best, prob / prob.sum()
 
 
@@ -223,12 +258,16 @@ def measure_and_select(prob, E, states, users, cand, rng):
     feas = [c for c in feas if is_feasible(c[1])]
     if feas:
         return min(feas, key=lambda c: c[0])[1], True
-    # fallback: most probable feasible state in the full distribution
-    for i in np.argsort(-prob):
+    for i in np.argsort(-prob):                     # fallback: most probable feasible
         a = decode(states[i], users, cand)
         if is_feasible(a):
             return a, False
     return [], False
+
+
+def counts_from_aer(qc_bound, shots, seed):
+    from qaoa_circuit import sample_with_aer
+    return sample_with_aer(qc_bound, shots, seed)
 
 
 def assign_to_rf_chains(assign, G, beam_dict):
@@ -311,21 +350,69 @@ def run_seed(seed):
     Gn = G / G.max()
 
     Q, offset, S = build_qubo(Gn, users, cand)
-    check_ising(Q)
     K = len(users)
+    h, J, c = ising_from_qubo(Q)
+    check_ising_random(Q, h, J, c)
+
     states, E = subspace_energies(Q, offset, K, S)
+    E_ising = ising_energies_subspace(h, J, c, offset, states, K, S)
+    assert np.allclose(E, E_ising), "Ising and QUBO energies differ on the subspace"
 
-    # --- QAOA ---
-    res, prob = run_qaoa(E, K, S, P_DEPTH, N_RESTARTS, rng)
-    qaoa_assign, measured_ok = measure_and_select(prob, E, states, users, cand, rng)
+    extra = {}
 
-    # --- exact optimum in the subspace ---
+    # ------------------ QAOA ------------------
+    if BACKEND == "circuit":
+        import qaoa_circuit as qc_mod
+        res, prob_full, E_full, qc, gam, bet, stats = qc_mod.run_qaoa_circuit(
+            Q, offset, h, J, c, K, S, P_DEPTH, N_RESTARTS, rng, maxiter=MAXITER)
+
+        full_idx = qc_mod.subspace_to_full_index(states, S)
+        prob = prob_full[full_idx]                       # one-hot states only
+        extra["leakage"] = float(1.0 - prob.sum())       # probability outside the feasible subspace
+        prob = prob / prob.sum()
+
+        # cross-check circuit against the NumPy Trotterised simulation
+        psi = qaoa_state(res.x, E, K, S, "trotter")
+        extra["circuit_vs_numpy"] = float(
+            np.max(np.abs(np.abs(psi) ** 2 - prob_full[full_idx])))
+        extra["stats"] = stats
+
+        # measurement
+        bound = qc_mod.bound_circuit(qc, gam, bet, res.x, measure=True)
+        counts = counts_from_aer(bound, SHOTS, seed) if USE_AER_SAMPLING else None
+        if counts is not None:
+            idx_to_state = {int(f): i for i, f in enumerate(full_idx)}
+            feas = []
+            for bits in counts:
+                f = int(bits.replace(" ", ""), 2)        # little-endian: qubit i = bit i
+                if f in idx_to_state:
+                    i = idx_to_state[f]
+                    a = decode(states[i], users, cand)
+                    if is_feasible(a):
+                        feas.append((E[i], a))
+            if feas:
+                qaoa_assign, measured_ok = min(feas, key=lambda t: t[0])[1], True
+            else:
+                qaoa_assign, measured_ok = measure_and_select(
+                    prob, E, states, users, cand, rng)
+            extra["sampler"] = "Qiskit Aer"
+        else:
+            qaoa_assign, measured_ok = measure_and_select(
+                prob, E, states, users, cand, rng)
+            extra["sampler"] = "statevector sampling"
+        extra["circuit_obj"] = (qc if seed == 0 else None)
+    else:
+        res, prob = run_qaoa_statevector(E, K, S, P_DEPTH, N_RESTARTS, rng)
+        qaoa_assign, measured_ok = measure_and_select(prob, E, states, users, cand, rng)
+        extra["leakage"] = 0.0
+
+    # ------------------ exact optimum in the subspace ------------------
     feas_idx = [i for i in range(len(E))
                 if is_feasible(decode(states[i], users, cand))]
     opt_i = min(feas_idx, key=lambda i: E[i])
     opt_assign = decode(states[opt_i], users, cand)
 
-    # --- Greedy / OMP on the SAME subproblem ---
+    # ------------------ Greedy / OMP on the SAME subproblem ------------------
     ubeams = np.unique(cand)
     g_a, _ = greedy_assignment(G[users][:, ubeams], N_RF_SUB)
     greedy_assign = [(int(users[k]), int(ubeams[m])) for k, m in g_a]
@@ -337,13 +424,13 @@ def run_seed(seed):
                "QAOA-XY": qaoa_assign, "Optimal": opt_assign}
     results = {n: evaluate(a, H_users, beam_dict, G) for n, a in assigns.items()}
 
-    extra = dict(
+    extra.update(
         energy=float(res.fun), e_opt=float(E[opt_i]),
         # mean energy gap to the optimum over the FEASIBLE part of the output
         # distribution (0 = QAOA concentrates on the optimum)
-        approx_ratio=float(prob[feas_idx] @ E[feas_idx] / prob[feas_idx].sum()
-                           - E[opt_i]),
+        gap=float(prob[feas_idx] @ E[feas_idx] / prob[feas_idx].sum() - E[opt_i]),
         p_opt=float(prob[opt_i]), p_feas=float(prob[feas_idx].sum()),
+        p_uniform=1.0 / len(E),
         measured_feasible=measured_ok,
         qaoa_matches_opt=set(qaoa_assign) == set(opt_assign),
     )
@@ -366,9 +453,10 @@ def plot_main(all_res):
         ax.set_title(title)
         ax.tick_params(axis="x", rotation=30)
     fig.suptitle(f"Beam assignment performance over {len(all_res)} seeds "
-                 f"({K_SUB} users, {M_CAND} beams/user, {N_RF_SUB} RF chains)")
+                 f"({K_SUB} users, {M_CAND} beams/user, {N_RF_SUB} RF chains, "
+                 f"{BACKEND} backend)")
     fig.tight_layout()
-    fig.savefig("qaoa_results.png", dpi=300)
+    fig.savefig(f"qaoa_results_{BACKEND}.png", dpi=300)
 
 
 def plot_fairness(all_res):
@@ -400,7 +488,7 @@ def plot_fairness(all_res):
     ax3.tick_params(axis="x", rotation=30)
 
     fig.tight_layout()
-    fig.savefig("qaoa_fairness.png", dpi=300)
+    fig.savefig(f"qaoa_fairness_{BACKEND}.png", dpi=300)
 
 
 def plot_interference(all_res):
@@ -437,7 +525,15 @@ def plot_interference(all_res):
     fig.colorbar(img, ax=ax3)
 
     fig.tight_layout()
-    fig.savefig("qaoa_interference.png", dpi=300)
+    fig.savefig(f"qaoa_interference_{BACKEND}.png", dpi=300)
+
+
+def draw_circuit(qc):
+    try:
+        fig = qc.draw(output="mpl", fold=60, scale=0.5)
+        fig.savefig(f"qaoa_circuit_{BACKEND}.png", dpi=200, bbox_inches="tight")
+    except Exception as e:                       # drawing needs pylatexenc
+        print("Circuit drawing skipped:", e)
 
 
 # ======================================================
@@ -446,6 +542,8 @@ def plot_interference(all_res):
 
 if __name__ == "__main__":
     all_res, all_extra = [], []
+    print(f"Backend: {BACKEND} | subproblem: {K_SUB} users x {M_CAND} beams, "
+          f"{N_RF_SUB} RF chains | p = {P_DEPTH} | mixer = {MIXER}")
 
     for seed in range(N_SEEDS):
         print("\n" + "=" * 60)
@@ -455,12 +553,27 @@ if __name__ == "__main__":
         all_res.append(results)
         all_extra.append(extra)
 
+        if seed == 0 and BACKEND == "circuit":
+            st = extra["stats"]
+            print(f"Circuit: {st['n_qubits']} qubits, depth {st['depth']}, "
+                  f"{st['two_qubit_gates']} two-qubit gates, "
+                  f"{st['n_pauli_terms']} Pauli terms in H_C")
+            print(f"         gate counts {st['ops']}")
+            print(f"         Pauli operator vs QUBO diagonal error: "
+                  f"{st['operator_check_err']:.2e}")
+            draw_circuit(extra["circuit_obj"])
+
         print("RF chain assignment:")
         for name in METHODS:
             print_rf_table(name, results[name]["table"])
         print(f"  QAOA: <E>={extra['energy']:.4f}  E_opt={extra['e_opt']:.4f}  "
-              f"P(optimal)={extra['p_opt']:.3f}  P(feasible)={extra['p_feas']:.3f}  "
+              f"P(optimal)={extra['p_opt']:.4f} (uniform {extra['p_uniform']:.4f})  "
+              f"P(feasible)={extra['p_feas']:.3f}  "
               f"matches optimum: {extra['qaoa_matches_opt']}")
+        if BACKEND == "circuit":
+            print(f"        leakage out of one-hot subspace = {extra['leakage']:.2e}  "
+                  f"| circuit vs NumPy max prob. diff = {extra['circuit_vs_numpy']:.2e}  "
+                  f"| sampler: {extra['sampler']}")
         for name in METHODS:
             r = results[name]
             print(f"  {name:8s} gain={r['gain']:.4f}  SINR={r['sinr_db']:.2f} dB  "
@@ -480,13 +593,19 @@ if __name__ == "__main__":
               f"{g('mean_interf_db'):11.2f}")
 
     print(f"\nQAOA mean energy gap to optimum (feasible): "
-          f"{np.nanmean([e['approx_ratio'] for e in all_extra]):.3f}")
+          f"{np.mean([e['gap'] for e in all_extra]):.3f}")
     print(f"QAOA mean P(optimal):          "
-          f"{np.mean([e['p_opt'] for e in all_extra]):.3f}")
+          f"{np.mean([e['p_opt'] for e in all_extra]):.4f}  "
+          f"(uniform guess {all_extra[0]['p_uniform']:.4f})")
     print(f"QAOA mean P(feasible):         "
           f"{np.mean([e['p_feas'] for e in all_extra]):.3f}")
     print(f"QAOA found exact optimum in    "
           f"{sum(e['qaoa_matches_opt'] for e in all_extra)}/{N_SEEDS} seeds")
+    if BACKEND == "circuit":
+        print(f"Max leakage out of subspace:   "
+              f"{max(e['leakage'] for e in all_extra):.2e}")
+        print(f"Max circuit-vs-NumPy deviation: "
+              f"{max(e['circuit_vs_numpy'] for e in all_extra):.2e}")
 
     plot_main(all_res)
     plot_fairness(all_res)
