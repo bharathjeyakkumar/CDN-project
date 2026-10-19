@@ -35,6 +35,7 @@ from qiskit.circuit import ParameterVector
 from qiskit.quantum_info import SparsePauliOp, Statevector
 
 MAX_QUBITS = 20     # dense statevector bound used by this module
+SAMPLER_NAME = "Qiskit Aer"
 
 
 # ------------------------------------------------------
@@ -216,3 +217,21 @@ def sample_with_aer(qc_bound, shots, seed=0):
     sim = AerSimulator(seed_simulator=seed)
     job = sim.run(transpile(qc_bound, sim), shots=shots)
     return job.result().get_counts()
+
+
+def sample_indices(qc, gam, bet, params, shots, seed=0):
+    """
+    Measure the circuit on Aer. Returns the distinct basis-state indices observed
+    (little-endian: qubit i = bit i), or None if qiskit-aer is not installed.
+    """
+    counts = sample_with_aer(bound_circuit(qc, gam, bet, params, measure=True),
+                             shots, seed)
+    if counts is None:
+        return None
+    return np.array(sorted(int(b.replace(" ", ""), 2) for b in counts))
+
+
+def save_drawing(qc, path, params=None):
+    """Save a drawing of the parametrised circuit (needs pylatexenc)."""
+    fig = qc.draw(output="mpl", fold=60, scale=0.5)
+    fig.savefig(path, dpi=200, bbox_inches="tight")

@@ -3,13 +3,17 @@ XY-mixer QAOA beam-to-RF-chain assignment compared with Greedy, OMP and the
 exact optimum, with RF-chain mapping, gain / SINR / SE / EE, fairness and
 interference analysis.
 
+BACKEND = "pennylane"    gate-level PennyLane circuit (qaoa_pennylane.py), same gates as below.
 BACKEND = "circuit"      gate-level Qiskit circuit (qaoa_circuit.py):
                          W-state preparation, RZ/RZZ cost layer, RXX/RYY XY mixer.
                          Limited to ~20 qubits (K_SUB * (M_CAND + 1)).
 BACKEND = "statevector"  exact NumPy simulation inside the one-hot subspace.
                          Larger subproblems, no gate decomposition.
 
-In both backends the cost Hamiltonian comes from the QUBO -> Ising mapping
+The QUBO objective is the linearised sum of -ln(SINR_k) with victim-weighted
+leakage (see build_qubo); POOL_MODE controls which users form the subproblem.
+
+In all backends the cost Hamiltonian comes from the QUBO -> Ising mapping
 of Eqs. (10)-(12); the mapping is verified numerically on random bit strings,
 on every feasible-subspace state, and (circuit backend) against the Pauli
 operator that is compiled into the circuit.
@@ -17,7 +21,7 @@ operator that is compiled into the circuit.
 Figures written:
     qaoa_results_<backend>.png        gain / SINR / SE / EE
     qaoa_fairness_<backend>.png       per-user SE histogram, Jain index, worst user
-    qaoa_interference_<backend>.png   interference, SIR histogram, leakage map
+    qaoa_interference_<backend>.png   interference ratio I/(S+I), histogram, power-share map
     qaoa_circuit_<backend>.png        drawing of the parametrised circuit (circuit backend)
 """
 
@@ -38,8 +42,16 @@ from compute_sinr import compute_sinr_for_assignment
 # PARAMETERS
 # ======================================================
 
-BACKEND = "circuit"            # "circuit" or "statevector"
-USE_AER_SAMPLING = True        # circuit backend: sample final shots with Qiskit Aer if installed
+BACKEND = "pennylane"          # "pennylane", "circuit" (Qiskit) or "statevector"
+USE_SHOT_SAMPLING = True       # quantum backends: final measurement with shots on the backend simulator
+QUANTUM = BACKEND in ("pennylane", "circuit")
+
+if BACKEND == "pennylane":
+    import qaoa_pennylane as qc_mod
+elif BACKEND == "circuit":
+    import qaoa_circuit as qc_mod
+else:
+    qc_mod = None
 
 N_ANTENNAS = 16
 N_USERS = 20
@@ -48,19 +60,28 @@ N_HOTSPOTS = 3
 HOTSPOT_SPREAD_DEG = 3.0
 
 # subproblem solved by QAOA / Greedy / OMP / Optimal
-if BACKEND == "circuit":
+if QUANTUM:
     K_SUB, M_CAND, N_RF_SUB = 4, 2, 2      # 4 users x (2 beams + idle) = 12 qubits
-    MIXER = "trotter"                      # the circuit is a Trotterised XY mixer
+    MIXER = "trotter"                      # the circuits are Trotterised XY mixers
     N_RESTARTS, MAXITER = 4, 200
 else:
     K_SUB, M_CAND, N_RF_SUB = 6, 3, 3      # 6 x (3 + 1) = 24 qubits-equivalent subspace
     MIXER = "exact"                        # "exact" = expm of XY Hamiltonian, or "trotter"
     N_RESTARTS, MAXITER = 6, 300
 
-# QUBO weights (gains are normalised to max 1)
-MU = 1.0           # interference weight
-LAM_B = 2.0        # same-beam penalty
-LAM_C = 2.0        # "exactly N_RF_SUB served users" penalty
+# QUBO objective
+OBJECTIVE = "logsinr"   # "logsinr": first-order linearisation of sum_k -ln(SINR_k)  (new)
+                        # "legacy" : -gain + MU * leakage in absolute gains          (old)
+MU = 3.0                # weight of the interference term (1 = plain linearisation).
+                        # 3 sits at the SINR peak of the sweep; recalibrate with RUN_MU_SWEEP
+PENALTY_FACTOR = 2.0    # starting weight of constraint penalties, in units of the objective
+                        # scale; raised automatically until the QUBO ground state is feasible
+
+# subproblem user pool
+POOL_MODE = "mixed"     # "crowded": users from the busiest hotspot only (old behaviour)
+                        # "mixed"  : half from the busiest hotspot, the rest from other hotspots
+                        # "diverse": round-robin over all hotspots
+CAND_MIN_SEP = 1        # candidate beams per user must be >= this many grid steps apart
 
 # QAOA
 P_DEPTH = 2
@@ -71,6 +92,9 @@ TX_POWER_PER_STREAM_W = 1.0
 P_RF_CHAIN_W = 0.1
 NOISE_POWER = 1e-4
 
+RUN_MU_SWEEP = False   # True: first run the cheap exact-QUBO trade-off sweep over MU
+MU_GRID = [1, 2, 3, 5, 8, 15]
+
 N_SEEDS = 15
 METHODS = ["Greedy", "OMP", "QAOA-XY", "Optimal"]
 COLORS = {"Greedy": "tab:blue", "OMP": "tab:orange",
@@ -80,6 +104,61 @@ COLORS = {"Greedy": "tab:blue", "OMP": "tab:orange",
 # ======================================================
 # 1. SCENARIO AND SUBPROBLEM
 # ======================================================
+
+def select_pool(G, hot, k_sub, mode):
+    """
+    Choose which users form the subproblem. The same pool is given to every
+    method (Greedy, OMP, QAOA, Optimal), so the comparison stays fair.
+
+    crowded : strongest users of the busiest hotspot first (maximum contention,
+              but every pool user is angularly close, so any 2 served users interfere)
+    mixed   : ceil(k/2) strongest users of the busiest hotspot, the remaining slots
+              filled round-robin from the other hotspots (contention AND alternatives)
+    diverse : round-robin over all hotspots, busiest first
+    """
+    strength = G.max(1)
+    ids, counts = np.unique(hot, return_counts=True)
+    ids = ids[np.argsort(-counts)]                       # busiest hotspot first
+    per_hot = {h: [u for u in np.argsort(-strength) if hot[u] == h] for h in ids}
+
+    if mode == "crowded":
+        order = per_hot[ids[0]] + [u for h in ids[1:] for u in per_hot[h]]
+        return np.array(order[:k_sub])
+
+    pool = []
+    if mode == "mixed":
+        n_big = int(np.ceil(k_sub / 2))
+        pool += per_hot[ids[0]][:n_big]
+        rotation = list(ids[1:]) + [ids[0]]
+    else:                                                # diverse
+        rotation = list(ids)
+    ptr = {h: (n_big if (mode == "mixed" and h == ids[0]) else 0) for h in ids}
+    while len(pool) < k_sub:
+        progressed = False
+        for h in rotation:
+            if len(pool) < k_sub and ptr[h] < len(per_hot[h]):
+                pool.append(per_hot[h][ptr[h]])
+                ptr[h] += 1
+                progressed = True
+        if not progressed:
+            break
+    return np.array(pool[:k_sub])
+
+
+def candidate_beams(G, users, m, min_sep):
+    """Best m beams per user by gain, at least min_sep grid steps apart (circular grid)."""
+    n_beams = G.shape[1]
+    cand = []
+    for u in users:
+        chosen = []
+        for b in np.argsort(-G[u]):
+            if all(min(abs(b - c), n_beams - abs(b - c)) >= min_sep for c in chosen):
+                chosen.append(int(b))
+            if len(chosen) == m:
+                break
+        cand.append(chosen)
+    return np.array(cand)
+
 
 def build_subproblem(seed):
     sc = generate_stress_scenario(
@@ -92,12 +171,8 @@ def build_subproblem(seed):
     G = np.array([np.abs(h.flatten() @ beam_dict) ** 2 for h in H_users])
 
     hot = np.array([i["hotspot_id"] for i in info])
-    big = np.bincount(hot).argmax()                 # most crowded hotspot
-    order = np.argsort(-G.max(1))
-    users = [u for u in order if hot[u] == big]
-    users += [u for u in order if hot[u] != big]
-    users = np.array(users[:K_SUB])
-    cand = np.array([np.argsort(-G[u])[:M_CAND] for u in users])
+    users = select_pool(G, hot, K_SUB, POOL_MODE)
+    cand = candidate_beams(G, users, M_CAND, CAND_MIN_SEP)
     return H_users, beam_dict, G, users, cand
 
 
@@ -105,36 +180,103 @@ def build_subproblem(seed):
 # 2. QUBO AND ISING
 # ======================================================
 
-def build_qubo(Gn, users, cand):
-    """One qubit per (user, candidate beam) plus one idle qubit per user."""
+def build_qubo(G, users, cand, lam=None):
+    """
+    One qubit per (user, candidate beam) plus one idle qubit per user.
+
+    OBJECTIVE = "logsinr" (default)
+        Minimise  sum_k -ln SINR_k  over the served users, where
+        SINR_k = g_k / (I_k + n),  g_k = G[k, b_k],  I_k = sum_{k' != k} G[k, b_k'].
+        Linearising ln(I_k + n) around a reference leakage level Ibar_k gives
+            sum_k [ -ln g_k + I_k / (Ibar_k + n) ] + const,
+        which is quadratic in the binary variables:
+          * diagonal : -ln(g / g_ref)             (strong beams are cheap)
+          * pair     : G[k, b'] / (Ibar_k + n) + G[k', b] / (Ibar_k' + n)
+        Because leakage is divided by the VICTIM's own reference level, weak or
+        already-interfered users are protected first (fairness), and the log
+        rewards balanced SINRs instead of one very strong link.
+        Ibar_k is the mean leakage into user k over all other pool candidates.
+    OBJECTIVE = "legacy": -G/G.max() on the diagonal, MU * (leakage) on pairs.
+
+    The objective is shifted by a per-served-user constant (does not change which
+    feasible state is optimal) and scaled to max |coefficient| = 1, so the constraint
+    penalties are expressed in units of the objective.
+    """
+    lam = PENALTY_FACTOR if lam is None else lam
     K, m = cand.shape
     S = m + 1
     N = K * S
     q = lambda k, s: k * S + s
-    Q = np.zeros((N, N))
 
-    for k in range(K):                              # signal (minimise -gain)
-        for s in range(m):
-            Q[q(k, s), q(k, s)] -= Gn[users[k], cand[k, s]]
+    D = np.zeros(N)                                  # diagonal (signal) part
+    P = np.zeros((N, N))                             # pair weights, w placed once per (i, j)
 
-    for k, k2 in itertools.combinations(range(K), 2):
-        for s in range(m):
-            for s2 in range(m):
-                b, b2 = cand[k, s], cand[k2, s2]
-                w = MU * (Gn[users[k], b2] + Gn[users[k2], b])   # leakage
-                if b == b2:
-                    w += LAM_B                                   # beam clash
-                Q[q(k, s), q(k2, s2)] += w / 2
-                Q[q(k2, s2), q(k, s)] += w / 2
+    if OBJECTIVE == "legacy":
+        Gn = G / G.max()
+        for k in range(K):
+            for s in range(m):
+                D[q(k, s)] = -Gn[users[k], cand[k, s]]
+        for k, k2 in itertools.combinations(range(K), 2):
+            for s in range(m):
+                for s2 in range(m):
+                    b, b2 = cand[k, s], cand[k2, s2]
+                    P[q(k, s), q(k2, s2)] = MU * (Gn[users[k], b2] + Gn[users[k2], b])
+    else:
+        noise = NOISE_POWER / TX_POWER_PER_STREAM_W
+        g_ref = max(G[users[k], cand[k, s]] for k in range(K) for s in range(m))
+        Ibar = np.zeros(K)
+        for k in range(K):
+            leak = [G[users[k], cand[k2, s2]]
+                    for k2 in range(K) if k2 != k for s2 in range(m)]
+            Ibar[k] = np.mean(leak) if leak else 0.0
+        wv = 1.0 / (Ibar + noise)                    # victim weights
+        for k in range(K):
+            for s in range(m):
+                D[q(k, s)] = -np.log(G[users[k], cand[k, s]] / g_ref)
+        for k, k2 in itertools.combinations(range(K), 2):
+            for s in range(m):
+                for s2 in range(m):
+                    b, b2 = cand[k, s], cand[k2, s2]
+                    P[q(k, s), q(k2, s2)] = MU * (wv[k] * G[users[k], b2]
+                                                  + wv[k2] * G[users[k2], b])
 
     served = [q(k, s) for k in range(K) for s in range(m)]
-    for i in served:                                # LAM_C (sum x - R)^2
-        Q[i, i] += LAM_C * (1 - 2 * N_RF_SUB)
+    # typical cost of serving one user alongside N_RF_SUB - 1 others -> remove it
+    # (a constant on every state that serves exactly N_RF_SUB users)
+    pair_mean = np.mean([P[i, j] for i, j in itertools.combinations(served, 2)
+                         if i // S != j // S] or [0.0])
+    D[served] -= (D[served].mean() + (N_RF_SUB - 1) * pair_mean)
+    scale = max(np.abs(D[served]).max(), np.abs(P).max(), 1e-12)
+    D, P = D / scale, P / scale
+
+    Q = np.zeros((N, N))
+    Q[np.diag_indices(N)] = D
+    Q += P / 2 + P.T / 2
+
+    for k, k2 in itertools.combinations(range(K), 2):        # same beam twice
+        for s in range(m):
+            for s2 in range(m):
+                if cand[k, s] == cand[k2, s2]:
+                    Q[q(k, s), q(k2, s2)] += lam / 2
+                    Q[q(k2, s2), q(k, s)] += lam / 2
+
+    for i in served:                                # lam * (sum x - R)^2, using x^2 = x
+        Q[i, i] += lam * (1 - 2 * N_RF_SUB)
     for i, j in itertools.combinations(served, 2):
-        Q[i, j] += LAM_C
-        Q[j, i] += LAM_C
-    offset = LAM_C * N_RF_SUB ** 2
+        Q[i, j] += lam
+        Q[j, i] += lam
+    offset = lam * N_RF_SUB ** 2
     return Q, offset, S
+
+
+def feasible_mask(states, users, cand):
+    return np.array([is_feasible(decode(s, users, cand)) for s in states])
+
+
+def penalties_sufficient(E, states, users, cand):
+    """The QUBO ground state must be a feasible assignment (not a penalised one)."""
+    mask = feasible_mask(states, users, cand)
+    return bool(mask.all() or E[mask].min() <= E[~mask].min() + 1e-12)
 
 
 def ising_from_qubo(Q):
@@ -265,11 +407,6 @@ def measure_and_select(prob, E, states, users, cand, rng):
     return [], False
 
 
-def counts_from_aer(qc_bound, shots, seed):
-    from qaoa_circuit import sample_with_aer
-    return sample_with_aer(qc_bound, shots, seed)
-
-
 def assign_to_rf_chains(assign, G, beam_dict):
     """
     Map the chosen (user, beam) pairs onto physical RF chains.
@@ -326,8 +463,9 @@ def evaluate(assign, H_users, beam_dict, G):
     L = TX_POWER_PER_STREAM_W * np.abs(Hs @ F_RF) ** 2
     signal = np.diag(L).copy()
     interference = L.sum(1) - signal
-    sir_db = 10 * np.log10(np.maximum(signal, 1e-12)
-                           / np.maximum(interference, 1e-12))
+    # Interference ratio I / (S + I): the share of the received power that is
+    # interference. Linear, bounded in [0, 1), and exactly 0 for zero interference.
+    leak_frac = interference / np.maximum(signal + interference, 1e-30)
 
     return dict(
         table=table, F_RF=F_RF, leakage=L,
@@ -335,8 +473,8 @@ def evaluate(assign, H_users, beam_dict, G):
         sinr_db_users=np.array(sinr_db), sinr_db=float(np.mean(sinr_db)),
         se_users=se_user, se=total_se, ee=ee,
         jain=jain_index(se_user), min_se=float(se_user.min()),
-        interference=interference, sir_db=sir_db,
-        mean_interf_db=float(10 * np.log10(np.mean(interference) + 1e-12)),
+        interference=interference, leak_frac=leak_frac,
+        mean_leak=float(np.mean(leak_frac)), max_leak=float(np.max(leak_frac)),
     )
 
 
@@ -347,22 +485,26 @@ def evaluate(assign, H_users, beam_dict, G):
 def run_seed(seed):
     rng = np.random.default_rng(seed)
     H_users, beam_dict, G, users, cand = build_subproblem(seed)
-    Gn = G / G.max()
-
-    Q, offset, S = build_qubo(Gn, users, cand)
     K = len(users)
+
+    lam = PENALTY_FACTOR                              # raise penalties until the QUBO
+    for _ in range(10):                               # ground state is a feasible assignment
+        Q, offset, S = build_qubo(G, users, cand, lam)
+        states, E = subspace_energies(Q, offset, K, S)
+        if penalties_sufficient(E, states, users, cand):
+            break
+        lam *= 1.5
+
     h, J, c = ising_from_qubo(Q)
     check_ising_random(Q, h, J, c)
 
-    states, E = subspace_energies(Q, offset, K, S)
     E_ising = ising_energies_subspace(h, J, c, offset, states, K, S)
     assert np.allclose(E, E_ising), "Ising and QUBO energies differ on the subspace"
 
-    extra = {}
+    extra = {"lam": lam}
 
     # ------------------ QAOA ------------------
-    if BACKEND == "circuit":
-        import qaoa_circuit as qc_mod
+    if QUANTUM:
         res, prob_full, E_full, qc, gam, bet, stats = qc_mod.run_qaoa_circuit(
             Q, offset, h, J, c, K, S, P_DEPTH, N_RESTARTS, rng, maxiter=MAXITER)
 
@@ -371,22 +513,21 @@ def run_seed(seed):
         extra["leakage"] = float(1.0 - prob.sum())       # probability outside the feasible subspace
         prob = prob / prob.sum()
 
-        # cross-check circuit against the NumPy Trotterised simulation
+        # cross-check the circuit against the NumPy Trotterised simulation
         psi = qaoa_state(res.x, E, K, S, "trotter")
         extra["circuit_vs_numpy"] = float(
             np.max(np.abs(np.abs(psi) ** 2 - prob_full[full_idx])))
         extra["stats"] = stats
 
-        # measurement
-        bound = qc_mod.bound_circuit(qc, gam, bet, res.x, measure=True)
-        counts = counts_from_aer(bound, SHOTS, seed) if USE_AER_SAMPLING else None
-        if counts is not None:
+        # measurement with shots on the backend simulator
+        observed = (qc_mod.sample_indices(qc, gam, bet, res.x, SHOTS, seed)
+                    if USE_SHOT_SAMPLING else None)
+        if observed is not None:
             idx_to_state = {int(f): i for i, f in enumerate(full_idx)}
             feas = []
-            for bits in counts:
-                f = int(bits.replace(" ", ""), 2)        # little-endian: qubit i = bit i
-                if f in idx_to_state:
-                    i = idx_to_state[f]
+            for f in observed:
+                if int(f) in idx_to_state:
+                    i = idx_to_state[int(f)]
                     a = decode(states[i], users, cand)
                     if is_feasible(a):
                         feas.append((E[i], a))
@@ -395,12 +536,13 @@ def run_seed(seed):
             else:
                 qaoa_assign, measured_ok = measure_and_select(
                     prob, E, states, users, cand, rng)
-            extra["sampler"] = "Qiskit Aer"
+            extra["sampler"] = qc_mod.SAMPLER_NAME
         else:
             qaoa_assign, measured_ok = measure_and_select(
                 prob, E, states, users, cand, rng)
             extra["sampler"] = "statevector sampling"
         extra["circuit_obj"] = (qc if seed == 0 else None)
+        extra["best_params"] = res.x
     else:
         res, prob = run_qaoa_statevector(E, K, S, P_DEPTH, N_RESTARTS, rng)
         qaoa_assign, measured_ok = measure_and_select(prob, E, states, users, cand, rng)
@@ -435,6 +577,69 @@ def run_seed(seed):
         qaoa_matches_opt=set(qaoa_assign) == set(opt_assign),
     )
     return results, extra
+
+
+# ======================================================
+# 6b. MU SWEEP (interference vs SINR / fairness trade-off)
+# ======================================================
+
+def mu_sweep(mus, seeds):
+    """
+    For every interference weight MU, solve the QUBO exactly inside the feasible
+    subspace (no QAOA, so it is fast) and report the mean metrics over the seeds,
+    next to Greedy. Use it to recalibrate MU on your own channel data.
+    """
+    global MU
+    keep, rows, greedy_rows = MU, [], []
+    for mu in mus:
+        MU = mu
+        recs = []
+        for seed in seeds:
+            H_users, beam_dict, G, users, cand = build_subproblem(seed)
+            K = len(users)
+            lam = PENALTY_FACTOR
+            for _ in range(10):
+                Q, offset, S = build_qubo(G, users, cand, lam)
+                states, E = subspace_energies(Q, offset, K, S)
+                if penalties_sufficient(E, states, users, cand):
+                    break
+                lam *= 1.5
+            mask = feasible_mask(states, users, cand)
+            best = np.where(mask)[0][np.argmin(E[mask])]
+            r = evaluate(decode(states[best], users, cand), H_users, beam_dict, G)
+            ub = np.unique(cand)
+            g_a, _ = greedy_assignment(G[users][:, ub], N_RF_SUB)
+            gr = evaluate([(int(users[k]), int(ub[b])) for k, b in g_a],
+                          H_users, beam_dict, G)
+            recs.append((r, gr))
+        rows.append({k: np.mean([a[k] for a, _ in recs])
+                     for k in ("mean_leak", "sinr_db", "se", "jain", "min_se")})
+        greedy_rows.append({k: np.mean([b[k] for _, b in recs])
+                            for k in ("mean_leak", "sinr_db", "se", "jain", "min_se")})
+    MU = keep
+
+    print("\nMU sweep (exact QUBO optimum vs Greedy, mean over seeds)")
+    print(f"{'MU':>5s}{'Interf':>10s}{'SINR dB':>9s}{'SE':>8s}{'Jain':>7s}{'MinSE':>8s}")
+    for mu, r in zip(mus, rows):
+        print(f"{mu:5g}{r['mean_leak']:10.4f}{r['sinr_db']:9.2f}"
+              f"{r['se']:8.3f}{r['jain']:7.3f}{r['min_se']:8.3f}")
+    g = greedy_rows[0]
+    print(f"{'Greedy':>5s}{g['mean_leak']:10.4f}{g['sinr_db']:9.2f}"
+          f"{g['se']:8.3f}{g['jain']:7.3f}{g['min_se']:8.3f}")
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
+    for ax, key, title in zip(axes, ("mean_leak", "sinr_db", "jain"),
+                              ("Interference ratio I/(S+I)  (0 = none)",
+                               "Average SINR (dB)", "Jain's fairness index")):
+        ax.plot(mus, [r[key] for r in rows], "o-", color=COLORS["Optimal"],
+                label="QUBO optimum")
+        ax.axhline(g[key], color=COLORS["Greedy"], linestyle="--", label="Greedy")
+        ax.set_xscale("log")
+        ax.set_xlabel("interference weight MU")
+        ax.set_title(title)
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(f"qaoa_mu_tradeoff_{POOL_MODE}.png", dpi=300)
 
 
 # ======================================================
@@ -492,47 +697,47 @@ def plot_fairness(all_res):
 
 
 def plot_interference(all_res):
+    """Linear, normalised interference: I / (S + I), 0 = no interference."""
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 4.5))
 
-    im = [np.mean([r[m]["mean_interf_db"] for r in all_res]) for m in METHODS]
-    isd = [np.std([r[m]["mean_interf_db"] for r in all_res]) for m in METHODS]
+    im = [np.mean([r[m]["mean_leak"] for r in all_res]) for m in METHODS]
+    isd = [np.std([r[m]["mean_leak"] for r in all_res]) for m in METHODS]
     ax1.bar(METHODS, im, yerr=isd, capsize=4, color=[COLORS[m] for m in METHODS])
-    ax1.set_title("Mean interference power per user (dB)")
+    ax1.set_ylim(bottom=0)
+    ax1.set_title("Mean interference ratio I/(S+I)  (0 = none)")
     ax1.tick_params(axis="x", rotation=30)
 
-    pooled = {m: np.concatenate([r[m]["sir_db"] for r in all_res])
+    pooled = {m: np.concatenate([r[m]["leak_frac"] for r in all_res])
               for m in METHODS}
-    lo = min(v.min() for v in pooled.values())
-    hi = max(v.max() for v in pooled.values())
-    bins = np.linspace(lo, hi, 20)
+    bins = np.linspace(0, max(v.max() for v in pooled.values()) * 1.05 + 1e-9, 20)
     for m in METHODS:
         ax2.hist(pooled[m], bins=bins, histtype="step", linewidth=2,
                  color=COLORS[m], label=m)
-    ax2.set_xlabel("Signal-to-interference ratio (dB)")
+    ax2.set_xlabel("Per-user interference ratio I/(S+I)")
     ax2.set_ylabel("Number of users (all seeds)")
-    ax2.set_title("Per-user SIR distribution")
+    ax2.set_title("Per-user interference distribution")
     ax2.legend()
 
     L = all_res[0]["QAOA-XY"]["leakage"]
     t = all_res[0]["QAOA-XY"]["table"]
-    img = ax3.imshow(10 * np.log10(np.maximum(L, 1e-12)), cmap="viridis")
+    share = L / L.sum(1, keepdims=True)              # row-normalised power shares
+    img = ax3.imshow(share, cmap="viridis", vmin=0, vmax=1)
     ax3.set_xticks(range(len(t)))
     ax3.set_xticklabels([f"RF{x['rf_chain']}" for x in t])
     ax3.set_yticks(range(len(t)))
     ax3.set_yticklabels([f"user {x['user']}" for x in t])
-    ax3.set_title("QAOA-XY leakage map, seed 0 (dB)\n"
-                  "diagonal = signal, off-diagonal = interference")
+    ax3.set_title("QAOA-XY power share per user, seed 0\n"
+                  "diagonal = signal (want 1), off-diagonal = interference (want 0)")
     fig.colorbar(img, ax=ax3)
 
     fig.tight_layout()
     fig.savefig(f"qaoa_interference_{BACKEND}.png", dpi=300)
 
 
-def draw_circuit(qc):
+def draw_circuit(qc, params=None):
     try:
-        fig = qc.draw(output="mpl", fold=60, scale=0.5)
-        fig.savefig(f"qaoa_circuit_{BACKEND}.png", dpi=200, bbox_inches="tight")
-    except Exception as e:                       # drawing needs pylatexenc
+        qc_mod.save_drawing(qc, f"qaoa_circuit_{BACKEND}.png", params)
+    except Exception as e:                       # e.g. Qiskit drawing needs pylatexenc
         print("Circuit drawing skipped:", e)
 
 
@@ -541,6 +746,9 @@ def draw_circuit(qc):
 # ======================================================
 
 if __name__ == "__main__":
+    if RUN_MU_SWEEP:
+        mu_sweep(MU_GRID, range(N_SEEDS))
+
     all_res, all_extra = [], []
     print(f"Backend: {BACKEND} | subproblem: {K_SUB} users x {M_CAND} beams, "
           f"{N_RF_SUB} RF chains | p = {P_DEPTH} | mixer = {MIXER}")
@@ -553,24 +761,26 @@ if __name__ == "__main__":
         all_res.append(results)
         all_extra.append(extra)
 
-        if seed == 0 and BACKEND == "circuit":
+        if seed == 0 and QUANTUM:
             st = extra["stats"]
-            print(f"Circuit: {st['n_qubits']} qubits, depth {st['depth']}, "
-                  f"{st['two_qubit_gates']} two-qubit gates, "
+            print(f"Circuit ({BACKEND}): {st['n_qubits']} qubits, compiled depth "
+                  f"{st['depth']}, {st['two_qubit_gates']} CNOTs, "
                   f"{st['n_pauli_terms']} Pauli terms in H_C")
+            if "device" in st:
+                print(f"         device: {st['device']}, optimizer: {st['optimizer']}")
             print(f"         gate counts {st['ops']}")
             print(f"         Pauli operator vs QUBO diagonal error: "
                   f"{st['operator_check_err']:.2e}")
-            draw_circuit(extra["circuit_obj"])
+            draw_circuit(extra["circuit_obj"], extra["best_params"])
 
         print("RF chain assignment:")
         for name in METHODS:
             print_rf_table(name, results[name]["table"])
-        print(f"  QAOA: <E>={extra['energy']:.4f}  E_opt={extra['e_opt']:.4f}  "
+        print(f"  QAOA: penalty={extra['lam']:.2f}  <E>={extra['energy']:.4f}  E_opt={extra['e_opt']:.4f}  "
               f"P(optimal)={extra['p_opt']:.4f} (uniform {extra['p_uniform']:.4f})  "
               f"P(feasible)={extra['p_feas']:.3f}  "
               f"matches optimum: {extra['qaoa_matches_opt']}")
-        if BACKEND == "circuit":
+        if QUANTUM:
             print(f"        leakage out of one-hot subspace = {extra['leakage']:.2e}  "
                   f"| circuit vs NumPy max prob. diff = {extra['circuit_vs_numpy']:.2e}  "
                   f"| sampler: {extra['sampler']}")
@@ -578,19 +788,19 @@ if __name__ == "__main__":
             r = results[name]
             print(f"  {name:8s} gain={r['gain']:.4f}  SINR={r['sinr_db']:.2f} dB  "
                   f"SE={r['se']:.3f}  EE={r['ee']:.3f}  Jain={r['jain']:.3f}  "
-                  f"interf={r['mean_interf_db']:.2f} dB")
+                  f"interf ratio={r['mean_leak']:.4f}")
 
     # ---------- summary ----------
     print("\n" + "=" * 78)
     print(f"SUMMARY (averaged over {N_SEEDS} seeds)")
     print("=" * 78)
     print(f"{'Method':9s}{'Gain':>9s}{'SINR dB':>10s}{'SE':>9s}{'EE':>9s}"
-          f"{'Jain':>8s}{'MinSE':>9s}{'Interf dB':>11s}")
+          f"{'Jain':>8s}{'MinSE':>9s}{'Interf':>10s}")
     for m in METHODS:
         g = lambda k: np.mean([r[m][k] for r in all_res])
         print(f"{m:9s}{g('gain'):9.4f}{g('sinr_db'):10.2f}{g('se'):9.3f}"
               f"{g('ee'):9.3f}{g('jain'):8.3f}{g('min_se'):9.3f}"
-              f"{g('mean_interf_db'):11.2f}")
+              f"{g('mean_leak'):10.4f}")
 
     print(f"\nQAOA mean energy gap to optimum (feasible): "
           f"{np.mean([e['gap'] for e in all_extra]):.3f}")
@@ -601,7 +811,7 @@ if __name__ == "__main__":
           f"{np.mean([e['p_feas'] for e in all_extra]):.3f}")
     print(f"QAOA found exact optimum in    "
           f"{sum(e['qaoa_matches_opt'] for e in all_extra)}/{N_SEEDS} seeds")
-    if BACKEND == "circuit":
+    if QUANTUM:
         print(f"Max leakage out of subspace:   "
               f"{max(e['leakage'] for e in all_extra):.2e}")
         print(f"Max circuit-vs-NumPy deviation: "
