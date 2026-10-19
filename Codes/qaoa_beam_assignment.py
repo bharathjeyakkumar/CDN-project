@@ -18,11 +18,10 @@ of Eqs. (10)-(12); the mapping is verified numerically on random bit strings,
 on every feasible-subspace state, and (circuit backend) against the Pauli
 operator that is compiled into the circuit.
 
-Figures written:
-    qaoa_results_<backend>.png        gain / SINR / SE / EE
-    qaoa_fairness_<backend>.png       per-user SE histogram, Jain index, worst user
-    qaoa_interference_<backend>.png   interference ratio I/(S+I), histogram, power-share map
-    qaoa_circuit_<backend>.png        drawing of the parametrised circuit (circuit backend)
+Figures written (Greedy / OMP / QAOA-XY only):
+    qaoa_sinr_<backend>.png          average SINR (dB)
+    qaoa_interference_<backend>.png  mean interference power per user (dB)
+    qaoa_fairness_<backend>.png      Jain's fairness index
 """
 
 import itertools
@@ -60,10 +59,16 @@ N_HOTSPOTS = 3
 HOTSPOT_SPREAD_DEG = 3.0
 
 # subproblem solved by QAOA / Greedy / OMP / Optimal
+QUBIT_PRESET = 12      # quantum backends: 12 or 18 qubits  (qubits = K_SUB * (M_CAND + 1))
+PRESETS = {                # (K_SUB users, M_CAND beams/user, N_RF_SUB RF chains, QAOA restarts)
+    12: (4, 2, 2, 4),      # 4 x 3 = 12 qubits
+    18: (6, 2, 3, 3),      # 6 x 3 = 18 qubits  (one-hot subspace has 3^6 = 729 states)
+}
+
 if QUANTUM:
-    K_SUB, M_CAND, N_RF_SUB = 4, 2, 2      # 4 users x (2 beams + idle) = 12 qubits
+    K_SUB, M_CAND, N_RF_SUB, N_RESTARTS = PRESETS[QUBIT_PRESET]
+    MAXITER = 200
     MIXER = "trotter"                      # the circuits are Trotterised XY mixers
-    N_RESTARTS, MAXITER = 4, 200
 else:
     K_SUB, M_CAND, N_RF_SUB = 6, 3, 3      # 6 x (3 + 1) = 24 qubits-equivalent subspace
     MIXER = "exact"                        # "exact" = expm of XY Hamiltonian, or "trotter"
@@ -96,7 +101,9 @@ RUN_MU_SWEEP = False   # True: first run the cheap exact-QUBO trade-off sweep ov
 MU_GRID = [1, 2, 3, 5, 8, 15]
 
 N_SEEDS = 15
-METHODS = ["Greedy", "OMP", "QAOA-XY", "Optimal"]
+METHODS = ["Greedy", "OMP", "QAOA-XY", "Optimal"]   # all methods that are evaluated
+PLOT_METHODS = ["Greedy", "OMP", "QAOA-XY"]          # methods shown in the graphs
+DRAW_CIRCUIT = False                                 # True: also save a drawing of the circuit
 COLORS = {"Greedy": "tab:blue", "OMP": "tab:orange",
           "QAOA-XY": "tab:green", "Optimal": "tab:red"}
 
@@ -475,6 +482,7 @@ def evaluate(assign, H_users, beam_dict, G):
         jain=jain_index(se_user), min_se=float(se_user.min()),
         interference=interference, leak_frac=leak_frac,
         mean_leak=float(np.mean(leak_frac)), max_leak=float(np.max(leak_frac)),
+        mean_interf_db=float(10 * np.log10(np.mean(interference) + 1e-12)),
     )
 
 
@@ -646,92 +654,43 @@ def mu_sweep(mus, seeds):
 # 7. PLOTS
 # ======================================================
 
-def plot_main(all_res):
-    specs = [("gain", "Total gain"), ("sinr_db", "Average SINR (dB)"),
-             ("se", "Total SE (bits/s/Hz)"), ("ee", "EE (bits/s/Hz/W)")]
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4.5))
-    for ax, (key, title) in zip(axes, specs):
-        means = [np.mean([r[m][key] for r in all_res]) for m in METHODS]
-        stds = [np.std([r[m][key] for r in all_res]) for m in METHODS]
-        ax.bar(METHODS, means, yerr=stds, capsize=4,
-               color=[COLORS[m] for m in METHODS])
-        ax.set_title(title)
-        ax.tick_params(axis="x", rotation=30)
-    fig.suptitle(f"Beam assignment performance over {len(all_res)} seeds "
-                 f"({K_SUB} users, {M_CAND} beams/user, {N_RF_SUB} RF chains, "
-                 f"{BACKEND} backend)")
-    fig.tight_layout()
-    fig.savefig(f"qaoa_results_{BACKEND}.png", dpi=300)
+def _bar(ax, all_res, key, title, ylabel):
+    means = [np.mean([r[mth][key] for r in all_res]) for mth in PLOT_METHODS]
+    stds = [np.std([r[mth][key] for r in all_res]) for mth in PLOT_METHODS]
+    bars = ax.bar(PLOT_METHODS, means, yerr=stds, capsize=5,
+                  color=[COLORS[mth] for mth in PLOT_METHODS])
+    for bar, v, s in zip(bars, means, stds):
+        y = v + s if v >= 0 else v - s               # just beyond the error bar
+        ax.annotate(f"{v:.2f}", (bar.get_x() + bar.get_width() / 2, y),
+                    ha="center", va="bottom" if v >= 0 else "top", fontsize=10)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
 
 
-def plot_fairness(all_res):
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 4.5))
+def plot_three(all_res):
+    """Three separate graphs: SINR, interference (dB), fairness. Greedy / OMP / QAOA-XY only."""
+    setup = (f"{len(all_res)} seeds, {K_SUB} users, {M_CAND} beams/user, "
+             f"{N_RF_SUB} RF chains, {BACKEND}")
 
-    pooled = {m: np.concatenate([r[m]["se_users"] for r in all_res])
-              for m in METHODS}
-    bins = np.linspace(0, max(v.max() for v in pooled.values()) * 1.05, 20)
-    for m in METHODS:
-        ax1.hist(pooled[m], bins=bins, histtype="step", linewidth=2,
-                 color=COLORS[m], label=m)
-    ax1.set_xlabel("Per-user spectral efficiency (bits/s/Hz)")
-    ax1.set_ylabel("Number of users (all seeds)")
-    ax1.set_title("Per-user SE distribution")
-    ax1.legend()
+    fig1, ax1 = plt.subplots(figsize=(6, 4.5))
+    _bar(ax1, all_res, "sinr_db", f"Average SINR (dB), higher is better\n{setup}", "SINR (dB)")
+    fig1.tight_layout()
+    fig1.savefig(f"qaoa_sinr_{BACKEND}.png", dpi=300)
 
-    jm = [np.mean([r[m]["jain"] for r in all_res]) for m in METHODS]
-    js = [np.std([r[m]["jain"] for r in all_res]) for m in METHODS]
-    ax2.bar(METHODS, jm, yerr=js, capsize=4, color=[COLORS[m] for m in METHODS])
-    ax2.axhline(1.0, color="gray", linestyle="--", linewidth=1)
-    ax2.set_ylim(0, 1.1)
-    ax2.set_title("Jain's fairness index (1 = perfectly fair)")
-    ax2.tick_params(axis="x", rotation=30)
+    fig2, ax2 = plt.subplots(figsize=(6, 4.5))
+    _bar(ax2, all_res, "mean_interf_db",
+         f"Mean interference power per user (dB), lower is better\n{setup}",
+         "Interference (dB)")
+    fig2.tight_layout()
+    fig2.savefig(f"qaoa_interference_{BACKEND}.png", dpi=300)
 
-    mm = [np.mean([r[m]["min_se"] for r in all_res]) for m in METHODS]
-    ms = [np.std([r[m]["min_se"] for r in all_res]) for m in METHODS]
-    ax3.bar(METHODS, mm, yerr=ms, capsize=4, color=[COLORS[m] for m in METHODS])
-    ax3.set_title("Worst-user SE (bits/s/Hz)")
-    ax3.tick_params(axis="x", rotation=30)
-
-    fig.tight_layout()
-    fig.savefig(f"qaoa_fairness_{BACKEND}.png", dpi=300)
-
-
-def plot_interference(all_res):
-    """Linear, normalised interference: I / (S + I), 0 = no interference."""
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 4.5))
-
-    im = [np.mean([r[m]["mean_leak"] for r in all_res]) for m in METHODS]
-    isd = [np.std([r[m]["mean_leak"] for r in all_res]) for m in METHODS]
-    ax1.bar(METHODS, im, yerr=isd, capsize=4, color=[COLORS[m] for m in METHODS])
-    ax1.set_ylim(bottom=0)
-    ax1.set_title("Mean interference ratio I/(S+I)  (0 = none)")
-    ax1.tick_params(axis="x", rotation=30)
-
-    pooled = {m: np.concatenate([r[m]["leak_frac"] for r in all_res])
-              for m in METHODS}
-    bins = np.linspace(0, max(v.max() for v in pooled.values()) * 1.05 + 1e-9, 20)
-    for m in METHODS:
-        ax2.hist(pooled[m], bins=bins, histtype="step", linewidth=2,
-                 color=COLORS[m], label=m)
-    ax2.set_xlabel("Per-user interference ratio I/(S+I)")
-    ax2.set_ylabel("Number of users (all seeds)")
-    ax2.set_title("Per-user interference distribution")
-    ax2.legend()
-
-    L = all_res[0]["QAOA-XY"]["leakage"]
-    t = all_res[0]["QAOA-XY"]["table"]
-    share = L / L.sum(1, keepdims=True)              # row-normalised power shares
-    img = ax3.imshow(share, cmap="viridis", vmin=0, vmax=1)
-    ax3.set_xticks(range(len(t)))
-    ax3.set_xticklabels([f"RF{x['rf_chain']}" for x in t])
-    ax3.set_yticks(range(len(t)))
-    ax3.set_yticklabels([f"user {x['user']}" for x in t])
-    ax3.set_title("QAOA-XY power share per user, seed 0\n"
-                  "diagonal = signal (want 1), off-diagonal = interference (want 0)")
-    fig.colorbar(img, ax=ax3)
-
-    fig.tight_layout()
-    fig.savefig(f"qaoa_interference_{BACKEND}.png", dpi=300)
+    fig3, ax3 = plt.subplots(figsize=(6, 4.5))
+    _bar(ax3, all_res, "jain", f"Jain's fairness index, higher is better\n{setup}",
+         "Jain's index")
+    ax3.set_ylim(0, 1.1)
+    fig3.tight_layout()
+    fig3.savefig(f"qaoa_fairness_{BACKEND}.png", dpi=300)
 
 
 def draw_circuit(qc, params=None):
@@ -771,7 +730,8 @@ if __name__ == "__main__":
             print(f"         gate counts {st['ops']}")
             print(f"         Pauli operator vs QUBO diagonal error: "
                   f"{st['operator_check_err']:.2e}")
-            draw_circuit(extra["circuit_obj"], extra["best_params"])
+            if DRAW_CIRCUIT:
+                draw_circuit(extra["circuit_obj"], extra["best_params"])
 
         print("RF chain assignment:")
         for name in METHODS:
@@ -788,19 +748,19 @@ if __name__ == "__main__":
             r = results[name]
             print(f"  {name:8s} gain={r['gain']:.4f}  SINR={r['sinr_db']:.2f} dB  "
                   f"SE={r['se']:.3f}  EE={r['ee']:.3f}  Jain={r['jain']:.3f}  "
-                  f"interf ratio={r['mean_leak']:.4f}")
+                  f"interf={r['mean_interf_db']:.2f} dB")
 
     # ---------- summary ----------
     print("\n" + "=" * 78)
     print(f"SUMMARY (averaged over {N_SEEDS} seeds)")
     print("=" * 78)
     print(f"{'Method':9s}{'Gain':>9s}{'SINR dB':>10s}{'SE':>9s}{'EE':>9s}"
-          f"{'Jain':>8s}{'MinSE':>9s}{'Interf':>10s}")
+          f"{'Jain':>8s}{'MinSE':>9s}{'Interf dB':>11s}")
     for m in METHODS:
         g = lambda k: np.mean([r[m][k] for r in all_res])
         print(f"{m:9s}{g('gain'):9.4f}{g('sinr_db'):10.2f}{g('se'):9.3f}"
               f"{g('ee'):9.3f}{g('jain'):8.3f}{g('min_se'):9.3f}"
-              f"{g('mean_leak'):10.4f}")
+              f"{g('mean_interf_db'):11.2f}")
 
     print(f"\nQAOA mean energy gap to optimum (feasible): "
           f"{np.mean([e['gap'] for e in all_extra]):.3f}")
@@ -817,7 +777,5 @@ if __name__ == "__main__":
         print(f"Max circuit-vs-NumPy deviation: "
               f"{max(e['circuit_vs_numpy'] for e in all_extra):.2e}")
 
-    plot_main(all_res)
-    plot_fairness(all_res)
-    plot_interference(all_res)
+    plot_three(all_res)
     plt.show()
