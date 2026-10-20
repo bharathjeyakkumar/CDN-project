@@ -104,6 +104,10 @@ N_SEEDS = 15
 METHODS = ["Greedy", "OMP", "QAOA-XY", "Optimal"]   # all methods that are evaluated
 PLOT_METHODS = ["Greedy", "OMP", "QAOA-XY"]          # methods shown in the graphs
 DRAW_CIRCUIT = False                                 # True: also save a drawing of the circuit
+OUTPUT_TAG = ""                                      # appended to the graph file names
+RUN_LABEL = "seeds"                                  # what one run is called in graph titles
+INTERF_YLABEL = "Interference (dB)"
+INTERF_TITLE = "Mean interference power per user (dB), lower is better"
 COLORS = {"Greedy": "tab:blue", "OMP": "tab:orange",
           "QAOA-XY": "tab:green", "Optimal": "tab:red"}
 
@@ -670,27 +674,26 @@ def _bar(ax, all_res, key, title, ylabel):
 
 def plot_three(all_res):
     """Three separate graphs: SINR, interference (dB), fairness. Greedy / OMP / QAOA-XY only."""
-    setup = (f"{len(all_res)} seeds, {K_SUB} users, {M_CAND} beams/user, "
+    setup = (f"{len(all_res)} {RUN_LABEL}, {K_SUB} users, {M_CAND} beams/user, "
              f"{N_RF_SUB} RF chains, {BACKEND}")
 
     fig1, ax1 = plt.subplots(figsize=(6, 4.5))
     _bar(ax1, all_res, "sinr_db", f"Average SINR (dB), higher is better\n{setup}", "SINR (dB)")
     fig1.tight_layout()
-    fig1.savefig(f"qaoa_sinr_{BACKEND}.png", dpi=300)
+    fig1.savefig(f"qaoa_sinr_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
 
     fig2, ax2 = plt.subplots(figsize=(6, 4.5))
     _bar(ax2, all_res, "mean_interf_db",
-         f"Mean interference power per user (dB), lower is better\n{setup}",
-         "Interference (dB)")
+         f"{INTERF_TITLE}\n{setup}", INTERF_YLABEL)
     fig2.tight_layout()
-    fig2.savefig(f"qaoa_interference_{BACKEND}.png", dpi=300)
+    fig2.savefig(f"qaoa_interference_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
 
     fig3, ax3 = plt.subplots(figsize=(6, 4.5))
     _bar(ax3, all_res, "jain", f"Jain's fairness index, higher is better\n{setup}",
          "Jain's index")
     ax3.set_ylim(0, 1.1)
     fig3.tight_layout()
-    fig3.savefig(f"qaoa_fairness_{BACKEND}.png", dpi=300)
+    fig3.savefig(f"qaoa_fairness_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
 
 
 def draw_circuit(qc, params=None):
