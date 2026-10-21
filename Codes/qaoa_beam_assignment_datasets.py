@@ -1,79 +1,203 @@
 """
-qaoa_beam_assignment_dataset.py -- the same QAOA / Greedy / OMP comparison as qaoa_beam_assignment.py,
-but the channels come from channel_test_suite_organized.xlsx (via dataset_channels.py).
+qaoa_beam_assignment_dataset.py -- QAOA / Greedy / OMP comparison on channels built from
+channel_test_suite_organized.xlsx.
+
+HOW TO RUN
+----------
+    python qaoa_beam_assignment_dataset.py
+        asks you to type the number of users, candidate beams per user and RF chains, prints what
+        that costs in qubits (and rough memory / time), asks for confirmation, then runs.
+
+    python qaoa_beam_assignment_dataset.py --users 6 --beams 2 --rf 3 --set "Set 1" --snapshots 5 --yes
+        same thing without questions.   --set: all | "Set 1" | "Set 2" | "Set 3"
 
 Needs, in the same folder:
-    qaoa_beam_assignment.py   (the QUBO, QAOA circuit, metrics and plots; nothing in it is duplicated here)
+    qaoa_beam_assignment.py   (QUBO, QAOA circuit, metrics, plots; nothing of it is duplicated here)
     dataset_channels.py       (spreadsheet loader + channel generation)
-    your channel file         (defines SCEN, C0, path_loss_db, _lsp, _nf_user, _ff_user; see CHANNEL_MODULE)
-    qaoa_pennylane.py, beam_dictionary.py, step1_greedy.py, step1_omp.py, compute_sinr.py
+    channels.py               (your channel model and codebooks)
+    qaoa_pennylane.py (or qaoa_circuit.py), step1_greedy.py, step1_omp.py, compute_sinr.py
     channel_test_suite_organized.xlsx
 
 What one run does
 -----------------
-1. Take the chosen set(s): DATA_SELECTION = "all" or "Set 1" / "Set 2" / "Set 3".
-2. For each set draw SNAPSHOTS_PER_SET snapshots. A snapshot = K_DROP users drawn at random from that
-   set (scenarios are mixed). All users of a snapshot share the set's antenna count N (64 or 128).
-3. Generate the noise-normalised channels from the spreadsheet rows.
-4. From the K_DROP users pick the QAOA subproblem (K_SUB users, N_RF_SUB RF chains, 2 candidate
-   beams each, 12 qubits with the default preset). Greedy, OMP, QAOA and the exact optimum all
-   solve exactly this subproblem.
-5. Evaluate, average over all snapshots, save the three graphs and a CSV.
+1. Take the chosen set(s). For each set draw SNAPSHOTS_PER_SET snapshots; a snapshot = K_DROP users drawn
+   at random from that set (scenarios mixed; all users of a snapshot share the set's antenna count N).
+2. Build the noise-normalised channels from the spreadsheet rows (dataset_channels.py).
+3. From the K_DROP users choose the QAOA subproblem: the number of users, beams and RF chains you typed.
+   Greedy, OMP, QAOA and the exact optimum all solve exactly this subproblem.
+4. Average over all snapshots, save the three graphs (SINR, interference, fairness) and a CSV.
 
-Units: the channel is noise-normalised (noise power = 1, transmit power already inside H).
-So the interference graph is interference-to-noise ratio in dB: 0 dB means interference equals the
-noise, lower is better, and below about -10 dB interference is negligible.
+Units: the channel is noise-normalised (noise power = 1, transmit power already inside H), so the
+interference graph is interference-to-noise ratio in dB: 0 dB = interference equals the noise.
 """
 
+import argparse
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 import qaoa_beam_assignment as base
 import dataset_channels as dc
-from beam_dictionary import generate_beam_dictionary
-from channels import SCEN, C0, path_loss_db, _lsp, _nf_user, _ff_user
+
 
 # ======================================================
-# CONFIGURATION
+# CONFIGURATION (defaults; the prompts / arguments override users, beams and RF chains)
 # ======================================================
 
 DATA_FILE = "channel_test_suite_organized.xlsx"
 DATA_SELECTION = "all"        # "all", "Set 1", "Set 2" or "Set 3"
 SNAPSHOTS_PER_SET = 10        # snapshots drawn per set ("all" = 3 sets -> 30 snapshots)
-K_DROP = 8                    # users drawn per snapshot (must be >= base.K_SUB)
-POOL_MODE = "mixed"           # which K_SUB of the K_DROP users form the subproblem:
+K_DROP = 8                    # users drawn per snapshot (raised automatically if you ask for more users)
+POOL_MODE = "mixed"           # which users of the snapshot form the subproblem:
                               #   "mixed"  : strongest user + its nearest-angle neighbours, rest far away in angle
                               #   "crowded": strongest user + nearest-angle neighbours only
                               #   "random" : random users
-SHADOWING = True              # spreadsheet path loss has no shadow fading, so add it (row sigma)
+CODEBOOK = "polar"            # "polar": your polar_codebook (DFT atoms + near-field atoms), "dft": DFT only
+CODEBOOK_OVERSAMPLE = 2       # your default
+CAND_RHO = 0.7                # candidate beams of one user must have |f_a^H f_b| < CAND_RHO (1.01 = plain top-m)
+SHADOWING = True              # the spreadsheet path loss has no shadow fading, so add it (row sigma)
 PATHLOSS_SOURCE = "dataset"   # "dataset" (spreadsheet column) or "model" (your path_loss_db())
 TX_DBM, BW_HZ, NF_DB = 30.0, 100e6, 9.0
 MASTER_SEED = 0
-OVERSAMPLING = 1              # codebook size = OVERSAMPLING * N beams
 RESULTS_CSV = "qaoa_dataset_results.csv"
 
+MAX_QUBITS = 20               # dense simulation limit of the circuit backends
+MAX_FEASIBLE_STATES = 2_000_000   # limit of the "statevector" backend (one-hot subspace size)
+
 
 # ======================================================
-# SNAPSHOTS
+# COST OF A CHOICE: qubits, memory, rough time
 # ======================================================
 
-def build_snapshots():
+def retries_for(qubits):
+    """Number of QAOA restarts used for a given size (fewer restarts for bigger circuits)."""
+    return 4 if qubits <= 12 else 3 if qubits <= 18 else 2
+
+
+def estimate_cost(users, beams, rf, n_snapshots):
+    """
+    qubits = users x (beams + 1): one qubit per (user, candidate beam) plus one 'idle' qubit per user.
+    Time is a ROUGH guess scaled from my own timings (about 0.02 s per optimiser step at 12 qubits and
+    0.6 s at 18, growing about x1.76 per extra qubit); your machine will differ.
+    """
+    q = users * (beams + 1)
+    feasible = (beams + 1) ** users
+    full_states = 2 ** q
+    mem_mb = 16 * full_states / 1e6                         # one complex128 state vector
+    restarts = retries_for(q)
+    steps = getattr(getattr(base, "qc_mod", None), "ADAM_STEPS", base.MAXITER)
+    step_s = 0.02 * 1.76 ** (q - 12)
+    per_snapshot = restarts * steps * step_s + 2.0 * step_s * 20 + 1.0
+    return dict(qubits=q, feasible=feasible, full_states=full_states, mem_mb=mem_mb,
+                restarts=restarts, per_snapshot_s=per_snapshot,
+                total_s=per_snapshot * n_snapshots, n_snapshots=n_snapshots)
+
+
+def check_choice(users, beams, rf):
+    """Returns (ok, message)."""
+    if users < 1 or beams < 1 or rf < 1:
+        return False, "users, beams and RF chains must all be at least 1."
+    if rf > users:
+        return False, f"RF chains ({rf}) cannot be more than users ({users})."
+    q = users * (beams + 1)
+    if base.QUANTUM and q > MAX_QUBITS:
+        return False, (f"{users} users x ({beams} beams + 1) = {q} qubits is more than the {MAX_QUBITS}-qubit "
+                       f"limit of the circuit backend. Reduce users or beams.")
+    if not base.QUANTUM and (beams + 1) ** users > MAX_FEASIBLE_STATES:
+        return False, f"({beams}+1)^{users} = {(beams + 1) ** users} feasible states is too many for the statevector backend."
+    return True, ""
+
+
+def print_cost(users, beams, rf, c):
+    t = c["total_s"]
+    t_txt = f"{t:.0f} s" if t < 120 else f"{t / 60:.1f} min" if t < 7200 else f"{t / 3600:.1f} h"
+    print("\n" + "-" * 62)
+    print("COST OF THIS CHOICE")
+    print("-" * 62)
+    print(f"  users in the subproblem        : {users}")
+    print(f"  candidate beams per user       : {beams}   (+1 idle slot per user)")
+    print(f"  RF chains (users served)       : {rf}")
+    print(f"  QUBITS = {users} x ({beams} + 1)          : {c['qubits']}")
+    print(f"  feasible assignments           : {c['feasible']:,}   (= ({beams}+1)^{users})")
+    if base.QUANTUM:
+        mem = f"{c['mem_mb'] * 1000:.0f} KB" if c["mem_mb"] < 1 else f"{c['mem_mb']:.0f} MB"
+        print(f"  full state vector              : 2^{c['qubits']} = {c['full_states']:,} amplitudes (~{mem})")
+        print(f"  QAOA restarts                  : {c['restarts']}")
+        print(f"  rough time                     : ~{t_txt} for {c['n_snapshots']} snapshots (very approximate)")
+    if c["qubits"] > 16 and base.QUANTUM:
+        print("  note: above 16 qubits every optimiser step becomes slow; test with --snapshots 1 first.")
+    print("-" * 62)
+
+
+# ======================================================
+# INPUT (typed answers or command-line arguments)
+# ======================================================
+
+def ask_int(text, default):
+    while True:
+        try:
+            s = input(f"{text} [{default}]: ").strip()
+        except EOFError:                       # no keyboard (script / pipe closed): use the default
+            return default
+        if s == "":
+            return default
+        try:
+            return int(s)
+        except ValueError:
+            print("  please type a whole number")
+
+
+def get_choice(args, n_snapshots_fn):
+    users, beams, rf = args.users, args.beams, args.rf
+    interactive = users is None or beams is None or rf is None
+    if interactive:
+        print("Choose the QAOA subproblem (press Enter to keep the value in brackets).")
+    while True:
+        users = args.users if args.users is not None else ask_int("  Number of users", base.K_SUB)
+        beams = args.beams if args.beams is not None else ask_int("  Candidate beams per user", base.M_CAND)
+        rf = args.rf if args.rf is not None else ask_int("  RF chains (users served)", min(base.N_RF_SUB, users))
+        ok, msg = check_choice(users, beams, rf)
+        print_cost(users, beams, rf, estimate_cost(users, beams, rf, n_snapshots_fn(users))) if ok else None
+        if not ok:
+            print(f"\n  Not possible: {msg}\n")
+            if not interactive:
+                sys.exit(1)
+            args.users = args.beams = args.rf = None
+            continue
+        if args.yes:
+            return users, beams, rf
+        try:
+            answer = input("Proceed with this choice? [Y/n]: ").strip().lower()
+        except EOFError:
+            answer = "y"
+        if answer in ("", "y", "yes"):
+            return users, beams, rf
+        args.users = args.beams = args.rf = None          # ask again
+
+
+# ======================================================
+# SNAPSHOTS AND SUBPROBLEM
+# ======================================================
+
+def build_snapshots(k_drop, selection, per_set):
     rng = np.random.default_rng(MASTER_SEED)
     df = dc.load_dataset(DATA_FILE)
-    sets = dc.choose_sets(df, DATA_SELECTION)
-    snaps = dc.draw_snapshots(sets, SNAPSHOTS_PER_SET, K_DROP, rng)
+    sets = dc.choose_sets(df, selection)
+    snaps = dc.draw_snapshots(sets, per_set, k_drop, rng)
     for i, s in enumerate(snaps):
         H, info = dc.generate_channels_from_rows(
             s["rows"], s["N"], rng, n_chains=base.N_RF_SUB, tx_dbm=TX_DBM, bw_hz=BW_HZ,
             nf_db=NF_DB, shadowing=SHADOWING, pathloss_source=PATHLOSS_SOURCE)
-        s.update(H=H, info=info, index=i)
+        s.update(H=H, info=info, index=i, fc=float(s["rows"]["fc_GHz"].iloc[0]))
     return snaps
 
 
 def select_pool(G, sin_phi, k_sub, mode, rng):
-    """Choose the K_SUB users of the subproblem. The same pool is given to every method."""
+    """Choose the subproblem users. The same pool is given to every method."""
     K = G.shape[0]
+    if k_sub >= K:
+        return np.arange(K)
     if mode == "random":
         return rng.choice(K, size=k_sub, replace=False)
     anchor = int(np.argmax(G.max(1)))
@@ -86,26 +210,50 @@ def select_pool(G, sin_phi, k_sub, mode, rng):
     return np.array(near + far)
 
 
-_BEAMS = {}
+def candidate_beams_distinct(G, F, users, m, rho):
+    """
+    For every user the m strongest beams that are mutually distinct: |f_a^H f_b| < rho.
+    Works for any codebook (including the stacked polar one). rho >= 1.01 gives plain top-m.
+    """
+    cand = []
+    for u in users:
+        chosen = []
+        for b in np.argsort(-G[u]):
+            if all(abs(np.vdot(F[:, c], F[:, b])) < rho for c in chosen):
+                chosen.append(int(b))
+            if len(chosen) == m:
+                break
+        if len(chosen) < m:                                       # not enough distinct beams: fill by gain
+            for b in np.argsort(-G[u]):
+                if int(b) not in chosen:
+                    chosen.append(int(b))
+                if len(chosen) == m:
+                    break
+        cand.append(chosen)
+    return np.array(cand)
 
 
-def beam_dictionary(N):
-    if N not in _BEAMS:
-        _BEAMS[N] = generate_beam_dictionary(N, OVERSAMPLING, 0.5)[0]
-    return _BEAMS[N]
+_CODEBOOKS = {}
+
+
+def codebook(N, fc):
+    key = (N, fc, CODEBOOK, CODEBOOK_OVERSAMPLE)
+    if key not in _CODEBOOKS:
+        _CODEBOOKS[key] = dc.get_codebook(CODEBOOK, N, fc, CODEBOOK_OVERSAMPLE)
+    return _CODEBOOKS[key]
 
 
 def make_build_subproblem(snaps):
     """Replacement for base.build_subproblem: 'seed' is the snapshot index."""
     def build_subproblem(i):
         s = snaps[i]
-        beam_dict = beam_dictionary(s["N"])
+        F = codebook(s["N"], s["fc"])
         H = s["H"]
-        G = np.abs(H @ beam_dict) ** 2                            # (K_DROP, n_beams)
+        G = np.abs(H @ F) ** 2                                     # (K_DROP, n_beams)
         rng = np.random.default_rng(MASTER_SEED + i)
         users = select_pool(G, s["info"]["sin_los"], base.K_SUB, POOL_MODE, rng)
-        cand = base.candidate_beams(G, users, base.M_CAND, base.CAND_MIN_SEP)
-        return [h for h in H], beam_dict, G, np.asarray(users), cand
+        cand = candidate_beams_distinct(G, F, users, base.M_CAND, CAND_RHO)
+        return [h for h in H], F, G, np.asarray(users), cand
     return build_subproblem
 
 
@@ -113,11 +261,31 @@ def make_build_subproblem(snaps):
 # MAIN
 # ======================================================
 
-if __name__ == "__main__":
-    if K_DROP < base.K_SUB:
-        raise ValueError(f"K_DROP ({K_DROP}) must be at least K_SUB ({base.K_SUB})")
+def parse_args():
+    p = argparse.ArgumentParser(description="QAOA beam assignment on the spreadsheet channels")
+    p.add_argument("--users", type=int, help="users in the QAOA subproblem")
+    p.add_argument("--beams", type=int, help="candidate beams per user")
+    p.add_argument("--rf", type=int, help="RF chains (users served)")
+    p.add_argument("--set", dest="set_", default=None, help='all | "Set 1" | "Set 2" | "Set 3"')
+    p.add_argument("--snapshots", type=int, default=None, help="snapshots per set")
+    p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    return p.parse_args()
 
-    snaps = build_snapshots()
+
+if __name__ == "__main__":
+    args = parse_args()
+    selection = args.set_ or DATA_SELECTION
+    per_set = args.snapshots or SNAPSHOTS_PER_SET
+    n_sets = 3 if selection == "all" else 1
+
+    users, beams, rf = get_choice(args, lambda u: per_set * n_sets)
+
+    # apply the choice to the shared QAOA code
+    base.K_SUB, base.M_CAND, base.N_RF_SUB = users, beams, rf
+    base.N_RESTARTS = retries_for(users * (beams + 1))
+    k_drop = max(K_DROP, users)
+
+    snaps = build_snapshots(k_drop, selection, per_set)
 
     # noise-normalised channel: noise power 1, transmit power already inside H
     base.NOISE_POWER = 1.0
@@ -128,10 +296,11 @@ if __name__ == "__main__":
     base.INTERF_YLABEL = "Interference-to-noise ratio (dB)"
     base.INTERF_TITLE = "Mean interference per user vs noise (dB, 0 = noise level), lower is better"
 
-    print(f"Data: {DATA_FILE} | selection: {DATA_SELECTION} | {len(snaps)} snapshots of "
-          f"{K_DROP} users | pool: {POOL_MODE} | shadowing: {SHADOWING}")
-    print(f"Backend: {base.BACKEND} | subproblem: {base.K_SUB} users x {base.M_CAND} beams, "
-          f"{base.N_RF_SUB} RF chains | p = {base.P_DEPTH}")
+    qubits = users * (beams + 1)
+    print(f"\nData: {DATA_FILE} | selection: {selection} | {len(snaps)} snapshots of {k_drop} users | "
+          f"pool: {POOL_MODE} | codebook: {CODEBOOK} | shadowing: {SHADOWING}")
+    print(f"Backend: {base.BACKEND} | subproblem: {users} users x {beams} beams, {rf} RF chains "
+          f"= {qubits} qubits | p = {base.P_DEPTH}")
 
     all_res, all_extra, rows = [], [], []
     for i, s in enumerate(snaps):
@@ -151,14 +320,14 @@ if __name__ == "__main__":
             r = results[name]
             print(f"  {name:8s} SINR={r['sinr_db']:.2f} dB  interf={r['mean_interf_db']:.2f} dB  "
                   f"Jain={r['jain']:.3f}  SE={r['se']:.3f}")
-            rows.append(dict(snapshot=i, set=s["set"], N=s["N"], method=name,
-                             sinr_db=r["sinr_db"], interference_db=r["mean_interf_db"],
-                             jain=r["jain"], sum_se=r["se"], min_user_se=r["min_se"],
-                             scenarios="|".join(s["info"]["scenario"])))
+            rows.append(dict(snapshot=i, set=s["set"], N=s["N"], users=users, beams=beams, rf_chains=rf,
+                             qubits=qubits, method=name, sinr_db=r["sinr_db"],
+                             interference_db=r["mean_interf_db"], jain=r["jain"], sum_se=r["se"],
+                             min_user_se=r["min_se"], scenarios="|".join(s["info"]["scenario"])))
 
     # ---------- summary ----------
     print("\n" + "=" * 70)
-    print(f"SUMMARY (averaged over {len(snaps)} snapshots)")
+    print(f"SUMMARY (averaged over {len(snaps)} snapshots, {qubits} qubits)")
     print("=" * 70)
     print(f"{'Method':9s}{'SINR dB':>10s}{'Interf dB':>11s}{'Jain':>8s}{'SE':>9s}{'MinSE':>9s}")
     for m in base.METHODS:
