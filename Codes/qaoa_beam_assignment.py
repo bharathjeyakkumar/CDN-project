@@ -3,23 +3,30 @@ XY-mixer QAOA beam-to-RF-chain assignment compared with Greedy, OMP and the
 exact optimum, with RF-chain mapping, gain / SINR / SE / EE, fairness and
 interference analysis.
 
-BACKEND = "pennylane"    gate-level PennyLane circuit (qaoa_pennylane.py), same gates as below.
-BACKEND = "circuit"      gate-level Qiskit circuit (qaoa_circuit.py):
-                         W-state preparation, RZ/RZZ cost layer, RXX/RYY XY mixer.
-                         Limited to ~20 qubits (K_SUB * (M_CAND + 1)).
-BACKEND = "statevector"  exact NumPy simulation inside the one-hot subspace.
-                         Larger subproblems, no gate decomposition.
+ENCODING (K*M qubits, no idle qubit)
+    One qubit per (user, candidate beam): qubit i = k * M_CAND + s is 1 when user k
+    uses its s-th candidate beam.  Number of qubits = K_SUB * M_CAND.
+    * "at most one beam per user" and "one user per beam" are QUBO penalties,
+    * "exactly N_RF_SUB assignments" is enforced by the ansatz itself:
+      Dicke initial state + XY mixer (Hamming weight is conserved), so no RF penalty
+      is needed (USE_RF_PENALTY = False).
+    The search space is the weight-N_RF_SUB subspace, C(K*M, N_RF) states.
+
+BACKEND = "pennylane"    gate-level PennyLane circuit (qaoa_pennylane.py).
+BACKEND = "circuit"      gate-level Qiskit circuit (qaoa_circuit.py).
+                         Both are limited to ~20 qubits (K_SUB * M_CAND).
+BACKEND = "statevector"  exact NumPy simulation inside the weight-N_RF subspace.
+                         Much larger subproblems, no gate decomposition.
 
 The QUBO objective is the linearised sum of -ln(SINR_k) with victim-weighted
 leakage (see build_qubo); POOL_MODE controls which users form the subproblem.
 
 In all backends the cost Hamiltonian comes from the QUBO -> Ising mapping
-of Eqs. (10)-(12); the mapping is verified numerically on random bit strings,
-on every feasible-subspace state, and (circuit backend) against the Pauli
-operator that is compiled into the circuit.
+of Eqs. (10)-(12); the mapping is verified numerically on random bit strings
+and on every state of the feasible-weight subspace.
 
 Figures written (Greedy / OMP / QAOA-XY only):
-    qaoa_sinr_<backend>.png          average SINR (dB)
+    qaoa_gain_<backend>.png          total gain of the selected beams (dB)
     qaoa_interference_<backend>.png  mean interference power per user (dB)
     qaoa_fairness_<backend>.png      Jain's fairness index
 """
@@ -27,7 +34,8 @@ Figures written (Greedy / OMP / QAOA-XY only):
 import itertools
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.linalg import expm
+from scipy import sparse
+from scipy.sparse.linalg import expm_multiply
 from scipy.optimize import minimize
 
 from beam_dictionary import generate_beam_dictionary
@@ -41,7 +49,7 @@ from compute_sinr import compute_sinr_for_assignment
 # PARAMETERS
 # ======================================================
 
-BACKEND = "pennylane"          # "pennylane", "circuit" (Qiskit) or "statevector"
+BACKEND = "statevector"          # "pennylane", "circuit" (Qiskit) or "statevector"
 USE_SHOT_SAMPLING = True       # quantum backends: final measurement with shots on the backend simulator
 QUANTUM = BACKEND in ("pennylane", "circuit")
 
@@ -59,10 +67,10 @@ N_HOTSPOTS = 3
 HOTSPOT_SPREAD_DEG = 3.0
 
 # subproblem solved by QAOA / Greedy / OMP / Optimal
-QUBIT_PRESET = 12      # quantum backends: 12 or 18 qubits  (qubits = K_SUB * (M_CAND + 1))
+QUBIT_PRESET = 12      # quantum backends: 12 or 18 qubits  (qubits = K_SUB * M_CAND)
 PRESETS = {                # (K_SUB users, M_CAND beams/user, N_RF_SUB RF chains, QAOA restarts)
-    12: (4, 2, 2, 4),      # 4 x 3 = 12 qubits
-    18: (6, 2, 3, 3),      # 6 x 3 = 18 qubits  (one-hot subspace has 3^6 = 729 states)
+    12: (4, 3, 2, 4),      # 4 x 3 = 12 qubits, C(12,2) = 66 states in the weight-2 subspace
+    18: (6, 3, 3, 3),      # 6 x 3 = 18 qubits, C(18,3) = 816 states in the weight-3 subspace
 }
 
 if QUANTUM:
@@ -70,9 +78,13 @@ if QUANTUM:
     MAXITER = 200
     MIXER = "trotter"                      # the circuits are Trotterised XY mixers
 else:
-    K_SUB, M_CAND, N_RF_SUB = 6, 3, 3      # 6 x (3 + 1) = 24 qubits-equivalent subspace
+    K_SUB, M_CAND, N_RF_SUB = 8, 3, 3      # 8 x 3 = 24 qubits-equivalent, C(24,3) = 2024 states
     MIXER = "exact"                        # "exact" = expm of XY Hamiltonian, or "trotter"
     N_RESTARTS, MAXITER = 6, 300
+
+MIXER_GRAPH = "ring"    # XY mixer coupling graph: "ring" (N edges) or "complete" (N(N-1)/2 edges)
+USE_RF_PENALTY = False  # False: the Dicke state + XY mixer already fix the number of served users.
+                        # True : also add lam*(sum x - N_RF)^2 (constant on the subspace, kept only for tests)
 
 # QUBO objective
 OBJECTIVE = "logsinr"   # "logsinr": first-order linearisation of sum_k -ln(SINR_k)  (new)
@@ -106,6 +118,9 @@ PLOT_METHODS = ["Greedy", "OMP", "QAOA-XY"]          # methods shown in the grap
 DRAW_CIRCUIT = False                                 # True: also save a drawing of the circuit
 OUTPUT_TAG = ""                                      # appended to the graph file names
 RUN_LABEL = "seeds"                                  # what one run is called in graph titles
+GAIN_IN_DB = True                                    # gain graph in dB (10 log10 of the summed beam gain) or linear
+GROUP_LABELS = None                                  # optional: one label per run (e.g. the data set); a dotted
+                                                     # line is drawn wherever the label changes
 INTERF_YLABEL = "Interference (dB)"
 INTERF_TITLE = "Mean interference power per user (dB), lower is better"
 COLORS = {"Greedy": "tab:blue", "OMP": "tab:orange",
@@ -193,7 +208,8 @@ def build_subproblem(seed):
 
 def build_qubo(G, users, cand, lam=None):
     """
-    One qubit per (user, candidate beam) plus one idle qubit per user.
+    One qubit per (user, candidate beam): N = K * m qubits, qubit index i = k * m + s.
+    There is NO idle qubit: a user that is not served simply has all m of its qubits at 0.
 
     OBJECTIVE = "logsinr" (default)
         Minimise  sum_k -ln SINR_k  over the served users, where
@@ -212,12 +228,17 @@ def build_qubo(G, users, cand, lam=None):
     The objective is shifted by a per-served-user constant (does not change which
     feasible state is optimal) and scaled to max |coefficient| = 1, so the constraint
     penalties are expressed in units of the objective.
+
+    Constraint penalties
+        same user, two beams : lam * x_{k,s} x_{k,s'}      (at most one beam per user)
+        same beam, two users : lam * x_{k,s} x_{k',s'}     (one user per beam)
+        RF cardinality       : only if USE_RF_PENALTY (otherwise the Dicke state / XY mixer fix it)
+    Returns Q and the constant offset.
     """
     lam = PENALTY_FACTOR if lam is None else lam
     K, m = cand.shape
-    S = m + 1
-    N = K * S
-    q = lambda k, s: k * S + s
+    N = K * m
+    q = lambda k, s: k * m + s
 
     D = np.zeros(N)                                  # diagonal (signal) part
     P = np.zeros((N, N))                             # pair weights, w placed once per (i, j)
@@ -251,18 +272,22 @@ def build_qubo(G, users, cand, lam=None):
                     P[q(k, s), q(k2, s2)] = MU * (wv[k] * G[users[k], b2]
                                                   + wv[k2] * G[users[k2], b])
 
-    served = [q(k, s) for k in range(K) for s in range(m)]
     # typical cost of serving one user alongside N_RF_SUB - 1 others -> remove it
     # (a constant on every state that serves exactly N_RF_SUB users)
-    pair_mean = np.mean([P[i, j] for i, j in itertools.combinations(served, 2)
-                         if i // S != j // S] or [0.0])
-    D[served] -= (D[served].mean() + (N_RF_SUB - 1) * pair_mean)
-    scale = max(np.abs(D[served]).max(), np.abs(P).max(), 1e-12)
+    pair_mean = np.mean([P[i, j] for i, j in itertools.combinations(range(N), 2)
+                         if i // m != j // m] or [0.0])
+    D -= (D.mean() + (N_RF_SUB - 1) * pair_mean)
+    scale = max(np.abs(D).max(), np.abs(P).max(), 1e-12)
     D, P = D / scale, P / scale
 
     Q = np.zeros((N, N))
     Q[np.diag_indices(N)] = D
     Q += P / 2 + P.T / 2
+
+    for k in range(K):                                       # at most one beam per user
+        for s, s2 in itertools.combinations(range(m), 2):
+            Q[q(k, s), q(k, s2)] += lam / 2
+            Q[q(k, s2), q(k, s)] += lam / 2
 
     for k, k2 in itertools.combinations(range(K), 2):        # same beam twice
         for s in range(m):
@@ -271,13 +296,15 @@ def build_qubo(G, users, cand, lam=None):
                     Q[q(k, s), q(k2, s2)] += lam / 2
                     Q[q(k2, s2), q(k, s)] += lam / 2
 
-    for i in served:                                # lam * (sum x - R)^2, using x^2 = x
-        Q[i, i] += lam * (1 - 2 * N_RF_SUB)
-    for i, j in itertools.combinations(served, 2):
-        Q[i, j] += lam
-        Q[j, i] += lam
-    offset = lam * N_RF_SUB ** 2
-    return Q, offset, S
+    offset = 0.0
+    if USE_RF_PENALTY:                              # lam * (sum x - R)^2, using x^2 = x
+        for i in range(N):
+            Q[i, i] += lam * (1 - 2 * N_RF_SUB)
+        for i, j in itertools.combinations(range(N), 2):
+            Q[i, j] += lam
+            Q[j, i] += lam
+        offset = lam * N_RF_SUB ** 2
+    return Q, offset
 
 
 def feasible_mask(states, users, cand):
@@ -310,74 +337,100 @@ def check_ising_random(Q, h, J, c, trials=20):
         assert np.isclose(e_q, e_i), (e_q, e_i)
 
 
-def ising_energies_subspace(h, J, c, offset, states, K, S):
-    """Ising energy of every one-hot state, to compare with the QUBO energy."""
-    X = np.zeros((len(states), K * S))
-    for k in range(K):
-        X[np.arange(len(states)), k * S + states[:, k]] = 1
-    s = 1 - 2 * X
-    Jm = np.zeros((K * S, K * S))
+def states_to_bits(states, N):
+    """states: (n, R) array of occupied qubit indices -> (n, N) 0/1 matrix."""
+    X = np.zeros((len(states), N))
+    X[np.arange(len(states))[:, None], states] = 1
+    return X
+
+
+def ising_energies_subspace(h, J, c, offset, states, N):
+    """Ising energy of every weight-R state, to compare with the QUBO energy."""
+    s = 1 - 2 * states_to_bits(states, N)
+    Jm = np.zeros((N, N))
     for (i, j), v in J.items():
         Jm[i, j] = v
     return s @ h + np.einsum("ni,ij,nj->n", s, Jm, s) + c + offset
 
 
 # ======================================================
-# 3. FEASIBLE-SUBSPACE STATEVECTOR SIMULATION (NumPy)
+# 3. FEASIBLE-WEIGHT SUBSPACE STATEVECTOR SIMULATION (NumPy)
 # ======================================================
 
-def subspace_energies(Q, offset, K, S):
-    states = np.array(list(itertools.product(range(S), repeat=K)))
-    X = np.zeros((len(states), K * S))
-    for k in range(K):
-        X[np.arange(len(states)), k * S + states[:, k]] = 1
+def subspace_energies(Q, offset, N, R):
+    """All C(N, R) bit strings with exactly R ones, and their QUBO energies."""
+    states = np.array(list(itertools.combinations(range(N), R)))
+    X = states_to_bits(states, N)
     E = np.einsum("ni,ij,nj->n", X, Q, X) + offset
     return states, E
 
 
-def xy_pairs(S):
-    """Must match qaoa_circuit.xy_pairs: fixed pair order of the XY mixer."""
-    return list(itertools.combinations(range(S), 2))
-
-
-def group_mixer(S, beta, mixer):
+def xy_edges(N, graph=None):
     """
-    XY mixer restricted to the one-hot sector of one group (S x S matrix).
-    exact   : exp(-i beta A), A = complete-graph adjacency
-    trotter : product over pairs of exp(-i beta (|a><b| + |b><a|)), the same
-              ordered product the RXX/RYY gates implement in the circuit.
+    Edges of the XY mixer, in a FIXED order. The circuit backends must apply their
+    RXX/RYY gates on exactly these pairs in exactly this order (they receive it as `edges`).
+    """
+    graph = MIXER_GRAPH if graph is None else graph
+    if graph == "complete":
+        return list(itertools.combinations(range(N), 2))
+    if N == 2:
+        return [(0, 1)]
+    return [(i, (i + 1) % N) for i in range(N)]              # ring
+
+
+def build_mixer_data(states, N, graph=None):
+    """
+    Action of the XY mixer inside the weight-R subspace.
+    For an edge (a, b), (XX + YY)/2 swaps the occupation of a and b. Within the subspace it
+    pairs state i with partner p[i] (only when a and b are occupied differently).
+    """
+    edges = xy_edges(N, graph)
+    n = len(states)
+    X = states_to_bits(states, N).astype(int)
+    index = {tuple(s): i for i, s in enumerate(states)}
+    partners = []
+    for a, b in edges:
+        p = np.arange(n)
+        differ = X[:, a] != X[:, b]
+        for i in np.flatnonzero(differ):
+            y = X[i].copy()
+            y[a], y[b] = y[b], y[a]
+            p[i] = index[tuple(np.flatnonzero(y))]
+        partners.append((p, differ))
+    rows = np.concatenate([np.flatnonzero(d) for _, d in partners])
+    cols = np.concatenate([p[d] for p, d in partners])
+    A = sparse.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
+    return dict(edges=edges, partners=partners, A=A)
+
+
+def apply_mixer(psi, beta, mix, mixer):
+    """
+    exact   : exp(-i beta A),  A = sum over edges of (XX + YY)/2 in the subspace
+    trotter : ordered product over edges of exp(-i beta (XX + YY)/2), i.e. what the
+              RXX(beta) RYY(beta) gate sequence implements; each edge is a 2x2 rotation
+              [[cos b, -i sin b], [-i sin b, cos b]] on the pairs (i, partner(i)).
     """
     if mixer == "exact":
-        A = np.ones((S, S)) - np.eye(S)
-        return expm(-1j * beta * A)
-    U = np.eye(S, dtype=complex)
-    for a, b in xy_pairs(S):
-        e = np.zeros((S, S))
-        e[a, b] = e[b, a] = 1
-        U = expm(-1j * beta * e) @ U
-    return U
-
-
-def apply_mixer(psi, U, K, S):
-    psi = psi.reshape((S,) * K)
-    for ax in range(K):
-        psi = np.moveaxis(np.tensordot(U, psi, axes=([1], [ax])), 0, ax)
-    return psi.reshape(-1)
-
-
-def qaoa_state(params, E, K, S, mixer):
-    p = len(params) // 2
-    gam, bet = params[:p], params[p:]
-    psi = np.ones(S ** K, dtype=complex) / np.sqrt(S ** K)   # product of W states
-    for l in range(p):
-        psi = psi * np.exp(-1j * gam[l] * E)                  # U_C
-        psi = apply_mixer(psi, group_mixer(S, bet[l], mixer), K, S)
+        return expm_multiply(-1j * beta * mix["A"], psi)
+    c, s = np.cos(beta), -1j * np.sin(beta)
+    for p, differ in mix["partners"]:
+        psi = np.where(differ, c * psi + s * psi[p], psi)
     return psi
 
 
-def run_qaoa_statevector(E, K, S, p, restarts, rng):
+def qaoa_state(params, E, mix, mixer):
+    p = len(params) // 2
+    gam, bet = params[:p], params[p:]
+    psi = np.ones(len(E), dtype=complex) / np.sqrt(len(E))   # Dicke state |D_N^R>
+    for l in range(p):
+        psi = psi * np.exp(-1j * gam[l] * E)                  # U_C
+        psi = apply_mixer(psi, bet[l], mix, mixer)            # U_XY
+    return psi
+
+
+def run_qaoa_statevector(E, mix, p, restarts, rng):
     def f(th):
-        return float(np.sum(np.abs(qaoa_state(th, E, K, S, MIXER)) ** 2 * E))
+        return float(np.sum(np.abs(qaoa_state(th, E, mix, MIXER)) ** 2 * E))
 
     best = None
     for _ in range(restarts):
@@ -386,7 +439,7 @@ def run_qaoa_statevector(E, K, S, p, restarts, rng):
         res = minimize(f, th0, method="COBYLA", options={"maxiter": MAXITER})
         if best is None or res.fun < best.fun:
             best = res
-    prob = np.abs(qaoa_state(best.x, E, K, S, MIXER)) ** 2
+    prob = np.abs(qaoa_state(best.x, E, mix, MIXER)) ** 2
     return best, prob / prob.sum()
 
 
@@ -395,12 +448,16 @@ def run_qaoa_statevector(E, K, S, p, restarts, rng):
 # ======================================================
 
 def decode(state, users, cand):
+    """state: occupied qubit indices -> list of (user, beam). Qubit i = k * m + s."""
     m = cand.shape[1]
-    return [(int(users[k]), int(cand[k, s])) for k, s in enumerate(state) if s < m]
+    return [(int(users[i // m]), int(cand[i // m, i % m])) for i in state]
 
 
 def is_feasible(assign):
-    return len(assign) == N_RF_SUB and len({b for _, b in assign}) == N_RF_SUB
+    """N_RF assignments, every user at most once, every beam at most once."""
+    return (len(assign) == N_RF_SUB
+            and len({u for u, _ in assign}) == N_RF_SUB
+            and len({b for _, b in assign}) == N_RF_SUB)
 
 
 def measure_and_select(prob, E, states, users, cand, rng):
@@ -498,11 +555,12 @@ def run_seed(seed):
     rng = np.random.default_rng(seed)
     H_users, beam_dict, G, users, cand = build_subproblem(seed)
     K = len(users)
+    N = K * cand.shape[1]                              # qubits = users x beams
 
     lam = PENALTY_FACTOR                              # raise penalties until the QUBO
     for _ in range(10):                               # ground state is a feasible assignment
-        Q, offset, S = build_qubo(G, users, cand, lam)
-        states, E = subspace_energies(Q, offset, K, S)
+        Q, offset = build_qubo(G, users, cand, lam)
+        states, E = subspace_energies(Q, offset, N, N_RF_SUB)
         if penalties_sufficient(E, states, users, cand):
             break
         lam *= 1.5
@@ -510,23 +568,27 @@ def run_seed(seed):
     h, J, c = ising_from_qubo(Q)
     check_ising_random(Q, h, J, c)
 
-    E_ising = ising_energies_subspace(h, J, c, offset, states, K, S)
+    E_ising = ising_energies_subspace(h, J, c, offset, states, N)
     assert np.allclose(E, E_ising), "Ising and QUBO energies differ on the subspace"
 
+    mix = build_mixer_data(states, N)
     extra = {"lam": lam}
 
     # ------------------ QAOA ------------------
     if QUANTUM:
+        # the circuit backend now receives (N, R, edges) instead of (K, S):
+        # Dicke state of weight R, cost layer from (h, J), XY mixer on `edges` in this order
         res, prob_full, E_full, qc, gam, bet, stats = qc_mod.run_qaoa_circuit(
-            Q, offset, h, J, c, K, S, P_DEPTH, N_RESTARTS, rng, maxiter=MAXITER)
+            Q, offset, h, J, c, N, N_RF_SUB, mix["edges"], P_DEPTH, N_RESTARTS, rng,
+            maxiter=MAXITER)
 
-        full_idx = qc_mod.subspace_to_full_index(states, S)
-        prob = prob_full[full_idx]                       # one-hot states only
-        extra["leakage"] = float(1.0 - prob.sum())       # probability outside the feasible subspace
+        full_idx = qc_mod.subspace_to_full_index(states, N)
+        prob = prob_full[full_idx]                       # weight-R states only
+        extra["leakage"] = float(1.0 - prob.sum())       # probability outside the weight-R subspace
         prob = prob / prob.sum()
 
         # cross-check the circuit against the NumPy Trotterised simulation
-        psi = qaoa_state(res.x, E, K, S, "trotter")
+        psi = qaoa_state(res.x, E, mix, "trotter")
         extra["circuit_vs_numpy"] = float(
             np.max(np.abs(np.abs(psi) ** 2 - prob_full[full_idx])))
         extra["stats"] = stats
@@ -556,7 +618,7 @@ def run_seed(seed):
         extra["circuit_obj"] = (qc if seed == 0 else None)
         extra["best_params"] = res.x
     else:
-        res, prob = run_qaoa_statevector(E, K, S, P_DEPTH, N_RESTARTS, rng)
+        res, prob = run_qaoa_statevector(E, mix, P_DEPTH, N_RESTARTS, rng)
         qaoa_assign, measured_ok = measure_and_select(prob, E, states, users, cand, rng)
         extra["leakage"] = 0.0
 
@@ -608,11 +670,11 @@ def mu_sweep(mus, seeds):
         recs = []
         for seed in seeds:
             H_users, beam_dict, G, users, cand = build_subproblem(seed)
-            K = len(users)
+            N = len(users) * cand.shape[1]
             lam = PENALTY_FACTOR
             for _ in range(10):
-                Q, offset, S = build_qubo(G, users, cand, lam)
-                states, E = subspace_energies(Q, offset, K, S)
+                Q, offset = build_qubo(G, users, cand, lam)
+                states, E = subspace_energies(Q, offset, N, N_RF_SUB)
                 if penalties_sufficient(E, states, users, cand):
                     break
                 lam *= 1.5
@@ -672,25 +734,62 @@ def _bar(ax, all_res, key, title, ylabel):
     ax.set_ylabel(ylabel)
 
 
+def _line(ax, all_res, key, title, ylabel, fn=None):
+    """One line per method, one point per run (seed / snapshot). fn optionally transforms the values."""
+    n = len(all_res)
+    x = np.arange(1, n + 1)
+    for mth in PLOT_METHODS:
+        y = [(fn(r[mth][key]) if fn else r[mth][key]) for r in all_res]
+        ax.plot(x, y, marker="o", markersize=4, linewidth=1.4, color=COLORS[mth],
+                label=f"{mth} (mean {np.mean(y):.2f})")
+    if GROUP_LABELS is not None and len(GROUP_LABELS) == n:
+        for i in range(1, n):
+            if GROUP_LABELS[i] != GROUP_LABELS[i - 1]:
+                ax.axvline(i + 0.5, color="gray", linestyle=":", linewidth=1)
+        top = ax.get_ylim()[1]
+        start = 0
+        for i in range(1, n + 1):
+            if i == n or GROUP_LABELS[i] != GROUP_LABELS[start]:
+                ax.text((start + 1 + i) / 2, top, str(GROUP_LABELS[start]), ha="center",
+                        va="bottom", fontsize=9, color="dimgray")
+                start = i
+    step = max(1, int(np.ceil(n / 30)))
+    ax.set_xticks(x[::step])
+    ax.tick_params(axis="x", labelsize=8)
+    ax.set_xlabel(f"{RUN_LABEL.rstrip('s').capitalize()} index")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, pad=18 if GROUP_LABELS is not None else 6)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=9)
+
+
 def plot_three(all_res):
-    """Three separate graphs: SINR, interference (dB), fairness. Greedy / OMP / QAOA-XY only."""
+    """Three separate line charts, one point per run: gain, interference (dB), fairness.
+    Greedy / OMP / QAOA-XY only."""
     setup = (f"{len(all_res)} {RUN_LABEL}, {K_SUB} users, {M_CAND} beams/user, "
              f"{N_RF_SUB} RF chains, {BACKEND}")
+    size = (11, 4.8)
 
-    fig1, ax1 = plt.subplots(figsize=(6, 4.5))
-    _bar(ax1, all_res, "sinr_db", f"Average SINR (dB), higher is better\n{setup}", "SINR (dB)")
+    fig1, ax1 = plt.subplots(figsize=size)
+    if GAIN_IN_DB:
+        _line(ax1, all_res, "gain",
+              f"Total beamforming gain of the selected beams (dB) per {RUN_LABEL.rstrip('s')}, higher is better\n{setup}",
+              "Total gain (dB)", fn=lambda g: 10 * np.log10(max(g, 1e-30)))
+    else:
+        _line(ax1, all_res, "gain",
+              f"Total beamforming gain of the selected beams per {RUN_LABEL.rstrip('s')}, higher is better\n{setup}",
+              "Total gain (linear)")
     fig1.tight_layout()
-    fig1.savefig(f"qaoa_sinr_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
+    fig1.savefig(f"qaoa_gain_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
 
-    fig2, ax2 = plt.subplots(figsize=(6, 4.5))
-    _bar(ax2, all_res, "mean_interf_db",
-         f"{INTERF_TITLE}\n{setup}", INTERF_YLABEL)
+    fig2, ax2 = plt.subplots(figsize=size)
+    _line(ax2, all_res, "mean_interf_db", f"{INTERF_TITLE}\n{setup}", INTERF_YLABEL)
     fig2.tight_layout()
     fig2.savefig(f"qaoa_interference_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
 
-    fig3, ax3 = plt.subplots(figsize=(6, 4.5))
-    _bar(ax3, all_res, "jain", f"Jain's fairness index, higher is better\n{setup}",
-         "Jain's index")
+    fig3, ax3 = plt.subplots(figsize=size)
+    _line(ax3, all_res, "jain", f"Jain's fairness index per {RUN_LABEL.rstrip('s')}, higher is better\n{setup}",
+          "Jain's index")
     ax3.set_ylim(0, 1.1)
     fig3.tight_layout()
     fig3.savefig(f"qaoa_fairness_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
@@ -712,8 +811,9 @@ if __name__ == "__main__":
         mu_sweep(MU_GRID, range(N_SEEDS))
 
     all_res, all_extra = [], []
-    print(f"Backend: {BACKEND} | subproblem: {K_SUB} users x {M_CAND} beams, "
-          f"{N_RF_SUB} RF chains | p = {P_DEPTH} | mixer = {MIXER}")
+    print(f"Backend: {BACKEND} | subproblem: {K_SUB} users x {M_CAND} beams "
+          f"= {K_SUB * M_CAND} qubits, {N_RF_SUB} RF chains | p = {P_DEPTH} | "
+          f"mixer = {MIXER} ({MIXER_GRAPH})")
 
     for seed in range(N_SEEDS):
         print("\n" + "=" * 60)
@@ -744,7 +844,7 @@ if __name__ == "__main__":
               f"P(feasible)={extra['p_feas']:.3f}  "
               f"matches optimum: {extra['qaoa_matches_opt']}")
         if QUANTUM:
-            print(f"        leakage out of one-hot subspace = {extra['leakage']:.2e}  "
+            print(f"        leakage out of weight-{N_RF_SUB} subspace = {extra['leakage']:.2e}  "
                   f"| circuit vs NumPy max prob. diff = {extra['circuit_vs_numpy']:.2e}  "
                   f"| sampler: {extra['sampler']}")
         for name in METHODS:

@@ -2,13 +2,17 @@
 qaoa_beam_assignment_dataset.py -- QAOA / Greedy / OMP comparison on channels built from
 channel_test_suite_organized.xlsx.
 
+ENCODING: one qubit per (user, candidate beam)  ->  qubits = users x beams.
+The number of served users (RF chains) is enforced by the ansatz (Dicke state + XY mixer),
+"at most one beam per user" and "one user per beam" by QUBO penalties.
+
 HOW TO RUN
 ----------
     python qaoa_beam_assignment_dataset.py
         asks you to type the number of users, candidate beams per user and RF chains, prints what
         that costs in qubits (and rough memory / time), asks for confirmation, then runs.
 
-    python qaoa_beam_assignment_dataset.py --users 6 --beams 2 --rf 3 --set "Set 1" --snapshots 5 --yes
+    python qaoa_beam_assignment_dataset.py --users 6 --beams 3 --rf 2 --set "Set 1" --snapshots 5 --yes
         same thing without questions.   --set: all | "Set 1" | "Set 2" | "Set 3"
 
 Needs, in the same folder:
@@ -25,7 +29,7 @@ What one run does
 2. Build the noise-normalised channels from the spreadsheet rows (dataset_channels.py).
 3. From the K_DROP users choose the QAOA subproblem: the number of users, beams and RF chains you typed.
    Greedy, OMP, QAOA and the exact optimum all solve exactly this subproblem.
-4. Average over all snapshots, save the three graphs (SINR, interference, fairness) and a CSV.
+4. Average over all snapshots, save the three graphs (gain, interference, fairness) and a CSV.
 
 Units: the channel is noise-normalised (noise power = 1, transmit power already inside H), so the
 interference graph is interference-to-noise ratio in dB: 0 dB = interference equals the noise.
@@ -33,6 +37,7 @@ interference graph is interference-to-noise ratio in dB: 0 dB = interference equ
 
 import argparse
 import sys
+from math import comb
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -63,7 +68,7 @@ MASTER_SEED = 0
 RESULTS_CSV = "qaoa_dataset_results.csv"
 
 MAX_QUBITS = 20               # dense simulation limit of the circuit backends
-MAX_FEASIBLE_STATES = 2_000_000   # limit of the "statevector" backend (one-hot subspace size)
+MAX_FEASIBLE_STATES = 2_000_000   # limit of the "statevector" backend (weight-R subspace size C(users*beams, R))
 
 
 # ======================================================
@@ -77,20 +82,23 @@ def retries_for(qubits):
 
 def estimate_cost(users, beams, rf, n_snapshots):
     """
-    qubits = users x (beams + 1): one qubit per (user, candidate beam) plus one 'idle' qubit per user.
+    qubits = users x beams: one qubit per (user, candidate beam), no idle qubit.
+    The ansatz (Dicke state + XY mixer) lives in the weight-rf subspace, C(qubits, rf) states;
+    'feasible' is the upper bound on fully valid assignments, C(users, rf) x beams^rf.
     Time is a ROUGH guess scaled from my own timings (about 0.02 s per optimiser step at 12 qubits and
     0.6 s at 18, growing about x1.76 per extra qubit); your machine will differ.
     """
-    q = users * (beams + 1)
-    feasible = (beams + 1) ** users
+    q = users * beams
+    feasible = comb(users, rf) * beams ** rf
+    subspace = comb(q, rf)
     full_states = 2 ** q
     mem_mb = 16 * full_states / 1e6                         # one complex128 state vector
     restarts = retries_for(q)
     steps = getattr(getattr(base, "qc_mod", None), "ADAM_STEPS", base.MAXITER)
     step_s = 0.02 * 1.76 ** (q - 12)
     per_snapshot = restarts * steps * step_s + 2.0 * step_s * 20 + 1.0
-    return dict(qubits=q, feasible=feasible, full_states=full_states, mem_mb=mem_mb,
-                restarts=restarts, per_snapshot_s=per_snapshot,
+    return dict(qubits=q, feasible=feasible, subspace=subspace, full_states=full_states,
+                mem_mb=mem_mb, restarts=restarts, per_snapshot_s=per_snapshot,
                 total_s=per_snapshot * n_snapshots, n_snapshots=n_snapshots)
 
 
@@ -100,12 +108,13 @@ def check_choice(users, beams, rf):
         return False, "users, beams and RF chains must all be at least 1."
     if rf > users:
         return False, f"RF chains ({rf}) cannot be more than users ({users})."
-    q = users * (beams + 1)
+    q = users * beams
     if base.QUANTUM and q > MAX_QUBITS:
-        return False, (f"{users} users x ({beams} beams + 1) = {q} qubits is more than the {MAX_QUBITS}-qubit "
+        return False, (f"{users} users x {beams} beams = {q} qubits is more than the {MAX_QUBITS}-qubit "
                        f"limit of the circuit backend. Reduce users or beams.")
-    if not base.QUANTUM and (beams + 1) ** users > MAX_FEASIBLE_STATES:
-        return False, f"({beams}+1)^{users} = {(beams + 1) ** users} feasible states is too many for the statevector backend."
+    if not base.QUANTUM and comb(q, rf) > MAX_FEASIBLE_STATES:
+        return False, (f"C({q},{rf}) = {comb(q, rf):,} states is too many for the statevector backend. "
+                       f"Reduce users, beams or RF chains.")
     return True, ""
 
 
@@ -116,10 +125,11 @@ def print_cost(users, beams, rf, c):
     print("COST OF THIS CHOICE")
     print("-" * 62)
     print(f"  users in the subproblem        : {users}")
-    print(f"  candidate beams per user       : {beams}   (+1 idle slot per user)")
+    print(f"  candidate beams per user       : {beams}")
     print(f"  RF chains (users served)       : {rf}")
-    print(f"  QUBITS = {users} x ({beams} + 1)          : {c['qubits']}")
-    print(f"  feasible assignments           : {c['feasible']:,}   (= ({beams}+1)^{users})")
+    print(f"  QUBITS = {users} x {beams}                 : {c['qubits']}")
+    print(f"  valid assignments (upper bound): {c['feasible']:,}   (= C({users},{rf}) x {beams}^{rf})")
+    print(f"  search space (weight-{rf} states): {c['subspace']:,}   (= C({c['qubits']},{rf}))")
     if base.QUANTUM:
         mem = f"{c['mem_mb'] * 1000:.0f} KB" if c["mem_mb"] < 1 else f"{c['mem_mb']:.0f} MB"
         print(f"  full state vector              : 2^{c['qubits']} = {c['full_states']:,} amplitudes (~{mem})")
@@ -282,7 +292,7 @@ if __name__ == "__main__":
 
     # apply the choice to the shared QAOA code
     base.K_SUB, base.M_CAND, base.N_RF_SUB = users, beams, rf
-    base.N_RESTARTS = retries_for(users * (beams + 1))
+    base.N_RESTARTS = retries_for(users * beams)
     k_drop = max(K_DROP, users)
 
     snaps = build_snapshots(k_drop, selection, per_set)
@@ -293,14 +303,15 @@ if __name__ == "__main__":
     base.build_subproblem = make_build_subproblem(snaps)
     base.OUTPUT_TAG = "_dataset"
     base.RUN_LABEL = "snapshots"
+    base.GROUP_LABELS = [s["set"] for s in snaps]
     base.INTERF_YLABEL = "Interference-to-noise ratio (dB)"
     base.INTERF_TITLE = "Mean interference per user vs noise (dB, 0 = noise level), lower is better"
 
-    qubits = users * (beams + 1)
+    qubits = users * beams
     print(f"\nData: {DATA_FILE} | selection: {selection} | {len(snaps)} snapshots of {k_drop} users | "
           f"pool: {POOL_MODE} | codebook: {CODEBOOK} | shadowing: {SHADOWING}")
     print(f"Backend: {base.BACKEND} | subproblem: {users} users x {beams} beams, {rf} RF chains "
-          f"= {qubits} qubits | p = {base.P_DEPTH}")
+          f"= {qubits} qubits | p = {base.P_DEPTH} | mixer = {base.MIXER} ({base.MIXER_GRAPH})")
 
     all_res, all_extra, rows = [], [], []
     for i, s in enumerate(snaps):
