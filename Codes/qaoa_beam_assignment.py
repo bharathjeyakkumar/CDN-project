@@ -49,7 +49,7 @@ from compute_sinr import compute_sinr_for_assignment
 # PARAMETERS
 # ======================================================
 
-BACKEND = "statevector"          # "pennylane", "circuit" (Qiskit) or "statevector"
+BACKEND = "pennylane"          # "pennylane", "circuit" (Qiskit) or "statevector"
 USE_SHOT_SAMPLING = True       # quantum backends: final measurement with shots on the backend simulator
 QUANTUM = BACKEND in ("pennylane", "circuit")
 

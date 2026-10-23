@@ -1,14 +1,15 @@
 """
-Gate-level XY-mixer QAOA in PennyLane.
+Gate-level XY-mixer QAOA in PennyLane (K*M-qubit encoding).
 
 Drop-in replacement for qaoa_circuit.py (same function names and return
 values), so qaoa_beam_assignment.py can use it with BACKEND = "pennylane".
 
-Qubit layout (identical to the Qiskit module)
----------------------------------------------
-User group k owns wires k*S ... k*S + S - 1  (S = M_CAND + 1 slots: M_CAND
-candidate beams + 1 idle slot). Exactly one wire per group is |1>.
-Wire index of (user k, slot s) = k*S + s, identical to the QUBO index.
+Qubit layout
+------------
+One wire per (user k, candidate beam s): wire = k * M_CAND + s, identical to the
+QUBO index. There is no idle qubit. The circuit keeps the Hamming weight at R
+(= number of RF chains): the initial state is the Dicke state |D_N^R> and the
+mixer is an XY mixer, so only bit strings with exactly R ones are ever reached.
 
 Bit-order warning
 -----------------
@@ -24,11 +25,16 @@ to the QUBO energy x^T Q x (+ offset), with h, J, c from Eqs. (10)-(12).
 
 Circuit per layer l
 -------------------
-  initial state : one W state per group (Dicke state with k = 1)
+  initial state : Dicke state |D_N^R>, Baertschi-Eidenbenz circuit
+                  (DICKE_PREP = "circuit", O(N*R) gates, O(N) depth)
+                  or a direct statevector load (DICKE_PREP = "statevector",
+                  faster, simulation only)
   U_C(gamma)    : RZ(2*gamma*h_i) on every wire
                   IsingZZ(2*gamma*J_ij) on every coupled pair
-  U_M(beta)     : for every group and every pair (a, b) in xy_pairs(S):
+  U_XY(beta)    : for every edge (a, b) in `edges`, in the given order:
                   IsingXX(beta) then IsingYY(beta) = exp(-i*beta/2 (XX + YY))
+`edges` comes from qaoa_beam_assignment.xy_edges(), so the NumPy cross-check
+in the main script uses exactly the same ordered product.
 
 Optimiser
 ---------
@@ -51,6 +57,7 @@ SAMPLER_NAME = "PennyLane shots"
 OPTIMIZER = "adam"        # "adam" or "cobyla"
 ADAM_STEPS = 120
 ADAM_LR = 0.08
+DICKE_PREP = "circuit"    # "circuit" (gate-level) or "statevector" (simulation shortcut)
 
 
 # ------------------------------------------------------
@@ -69,11 +76,6 @@ def make_device(n_wires):
 # helpers (big-endian indexing)
 # ------------------------------------------------------
 
-def xy_pairs(S):
-    """Fixed pair order of the XY mixer inside one group (complete graph)."""
-    return list(itertools.combinations(range(S), 2))
-
-
 def full_energies(Q, offset):
     """Diagonal of H_C over ALL 2^N basis states; wire 0 = most significant bit."""
     N = len(Q)
@@ -83,11 +85,20 @@ def full_energies(Q, offset):
     return np.einsum("ni,ij,nj->n", X, Q, X) + offset
 
 
-def subspace_to_full_index(states, S):
-    """Map one-hot subspace states (n, K) of slot indices to full basis indices."""
-    K = states.shape[1]
-    N = K * S
-    return sum((1 << (N - 1 - (k * S + states[:, k]))) for k in range(K))
+def subspace_to_full_index(states, N):
+    """
+    Map weight-R states, given as (n, R) arrays of occupied qubit indices,
+    to full basis-state indices (wire 0 = most significant bit).
+    """
+    return np.sum(1 << (N - 1 - np.asarray(states)), axis=1)
+
+
+def dicke_vector(N, R):
+    """Dicke state |D_N^R> as a 2^N statevector (big-endian)."""
+    v = np.zeros(2 ** N)
+    for pos in itertools.combinations(range(N), R):
+        v[sum(1 << (N - 1 - p) for p in pos)] = 1.0
+    return v / np.linalg.norm(v)
 
 
 # ------------------------------------------------------
@@ -131,20 +142,42 @@ def verify_cost_operator(H, const, E_full, N, atol=1e-8):
 # circuit building blocks
 # ------------------------------------------------------
 
-def prepare_w_state(wires):
-    """W state (Dicke D^n_1) with a cascade of controlled-RY and CNOT gates."""
-    n = len(wires)
-    qml.PauliX(wires=wires[0])
-    for i in range(n - 1):
-        theta = 2 * np.arcsin(np.sqrt((n - i - 1) / (n - i)))
-        qml.CRY(theta, wires=[wires[i], wires[i + 1]])
-        qml.CNOT(wires=[wires[i + 1], wires[i]])
+def _scs(n, k, off):
+    """
+    Split-and-cyclic-shift block SCS_{n,k} of Baertschi & Eidenbenz on wires
+    off ... off + n - 1 (it acts on the last k + 1 of them).
+    """
+    w = lambda i: off + i
+    qml.CNOT(wires=[w(n - 2), w(n - 1)])
+    qml.ctrl(qml.RY, control=[w(n - 1)])(2 * np.arccos(np.sqrt(1.0 / n)), wires=w(n - 2))
+    qml.CNOT(wires=[w(n - 2), w(n - 1)])
+    for l in range(2, k + 1):
+        qml.CNOT(wires=[w(n - l - 1), w(n - 1)])
+        qml.ctrl(qml.RY, control=[w(n - 1), w(n - l)])(
+            2 * np.arccos(np.sqrt(float(l) / n)), wires=w(n - l - 1))
+        qml.CNOT(wires=[w(n - l - 1), w(n - 1)])
 
 
-def qaoa_ops(params, h, J, K, S, p):
+def prepare_dicke_state(N, R):
+    """
+    Deterministic Dicke-state preparation |D_N^R> (Baertschi & Eidenbenz, FCT 2019):
+    start from |0^{N-R} 1^R> and apply SCS_{N,R}, ..., SCS_{R+1,R}, SCS_{R,R-1}, ..., SCS_{2,1}.
+    O(N*R) gates, O(N) depth.
+    """
+    for i in range(N - R, N):
+        qml.PauliX(wires=i)
+    for l in range(N, R, -1):
+        _scs(l, R, 0)
+    for l in range(R, 1, -1):
+        _scs(l, l - 1, 0)
+
+
+def qaoa_ops(params, h, J, N, R, edges, p):
     """Queue the full depth-p circuit. params = [gamma_1..gamma_p, beta_1..beta_p]."""
-    for k in range(K):
-        prepare_w_state(list(range(k * S, (k + 1) * S)))
+    if DICKE_PREP == "statevector":
+        qml.StatePrep(dicke_vector(N, R), wires=range(N))
+    else:
+        prepare_dicke_state(N, R)
     for l in range(p):
         gamma, beta = params[l], params[p + l]
         for i, hi in enumerate(h):                       # U_C
@@ -153,19 +186,16 @@ def qaoa_ops(params, h, J, K, S, p):
         for (i, j), v in J.items():
             if v != 0:
                 qml.IsingZZ(2 * gamma * float(v), wires=[i, j])
-        for k in range(K):                               # U_M (XY, Trotterised)
-            base = k * S
-            for a, b in xy_pairs(S):
-                qml.IsingXX(beta, wires=[base + a, base + b])
-                qml.IsingYY(beta, wires=[base + a, base + b])
+        for a, b in edges:                               # U_XY (Trotterised, fixed edge order)
+            qml.IsingXX(beta, wires=[a, b])
+            qml.IsingYY(beta, wires=[a, b])
 
 
 class PLCircuit:
     """Holds everything needed to run / sample / draw one QAOA circuit."""
 
-    def __init__(self, h, J, K, S, p, H, const):
-        self.h, self.J, self.K, self.S, self.p = h, J, K, S, p
-        self.N = K * S
+    def __init__(self, h, J, N, R, edges, p, H, const):
+        self.h, self.J, self.N, self.R, self.edges, self.p = h, J, N, R, list(edges), p
         self.H, self.const = H, float(const)
 
         dev, diff = make_device(self.N)
@@ -174,14 +204,14 @@ class PLCircuit:
 
         @qml.qnode(dev, diff_method=diff)
         def energy(params):
-            qaoa_ops(params, h, J, K, S, p)
+            qaoa_ops(params, h, J, N, R, self.edges, p)
             return qml.expval(H)
 
         dev_p = qml.device("default.qubit", wires=self.N)
 
         @qml.qnode(dev_p)
         def probs(params):
-            qaoa_ops(params, h, J, K, S, p)
+            qaoa_ops(params, h, J, N, R, self.edges, p)
             return qml.probs(wires=range(self.N))
 
         self.energy_qnode = energy
@@ -198,7 +228,7 @@ class PLCircuit:
 def circuit_statistics(circ, params):
     """Gate counts and depth, logical and compiled to {RZ, RX, RY, H, CNOT, X}."""
     with qml.queuing.AnnotatedQueue() as q:
-        qaoa_ops(params, circ.h, circ.J, circ.K, circ.S, circ.p)
+        qaoa_ops(params, circ.h, circ.J, circ.N, circ.R, circ.edges, circ.p)
     tape = qml.tape.QuantumScript(q.queue)
 
     def depth_of(ops):
@@ -225,9 +255,10 @@ def circuit_statistics(circ, params):
                      two_qubit_gates=count(comp).get("CNOT", 0))
     except Exception:                                   # fall back to analytic CNOT count
         ops = stats["logical_ops"]
-        cx = (2 * (ops.get("IsingZZ", 0) + ops.get("IsingXX", 0)
-                   + ops.get("IsingYY", 0) + ops.get("CRY", 0)) + ops.get("CNOT", 0))
+        cx = (2 * (ops.get("IsingZZ", 0) + ops.get("IsingXX", 0) + ops.get("IsingYY", 0))
+              + ops.get("CNOT", 0))
         stats.update(depth=stats["logical_depth"], ops=ops, two_qubit_gates=cx)
+        stats["note"] = "controlled rotations of the Dicke circuit are not included in the CNOT count"
     stats["device"] = f"{circ.device_name} ({circ.diff_method} gradients)"
     return stats
 
@@ -261,9 +292,14 @@ def _optimise_adam(circ, th0, steps, lr):
     return _Result(best_x, best_f)
 
 
-def run_qaoa_circuit(Q, offset, h, J, c, K, S, p, restarts, rng, maxiter=200):
+def run_qaoa_circuit(Q, offset, h, J, c, N, R, edges, p, restarts, rng, maxiter=200):
     """
     Optimise (gamma, beta) of the PennyLane circuit.
+
+    Parameters
+    ----------
+    N, R  : number of qubits (users x beams) and Hamming weight (RF chains)
+    edges : XY-mixer edges in application order (from qaoa_beam_assignment.xy_edges)
 
     Returns (same tuple as qaoa_circuit.run_qaoa_circuit)
     -------
@@ -274,13 +310,12 @@ def run_qaoa_circuit(Q, offset, h, J, c, K, S, p, restarts, rng, maxiter=200):
     None, None: placeholders (Qiskit's gamma / beta ParameterVectors)
     stats     : circuit statistics
     """
-    N = K * S
     E_full = full_energies(Q, offset)
     H = build_cost_operator(h, J, N)
     const = c + offset
     op_err = verify_cost_operator(H, const, E_full, N)
 
-    circ = PLCircuit(h, J, K, S, p, H, const)
+    circ = PLCircuit(h, J, N, R, edges, p, H, const)
 
     best = None
     for _ in range(restarts):
@@ -314,7 +349,7 @@ def sample_indices(circ, gam, bet, params, shots, seed=0):
 
     @qml.qnode(dev)
     def sampler(params):
-        qaoa_ops(params, circ.h, circ.J, circ.K, circ.S, circ.p)
+        qaoa_ops(params, circ.h, circ.J, circ.N, circ.R, circ.edges, circ.p)
         return qml.counts(wires=range(circ.N))
 
     sampler = qml.set_shots(sampler, shots=shots)
