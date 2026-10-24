@@ -24,12 +24,17 @@ Needs, in the same folder:
 
 What one run does
 -----------------
-1. Take the chosen set(s). For each set draw SNAPSHOTS_PER_SET snapshots; a snapshot = K_DROP users drawn
-   at random from that set (scenarios mixed; all users of a snapshot share the set's antenna count N).
-2. Build the noise-normalised channels from the spreadsheet rows (dataset_channels.py).
-3. From the K_DROP users choose the QAOA subproblem: the number of users, beams and RF chains you typed.
-   Greedy, OMP, QAOA and the exact optimum all solve exactly this subproblem.
-4. Average over all snapshots, save the three graphs (gain, interference, fairness) and a CSV.
+1. Take the chosen set(s) of the spreadsheet in file order. A snapshot = the next SNAPSHOT_SIZE (10) consecutive
+   rows. Every scenario of a set has exactly 10 rows, so snapshot 1 = the first scenario (UMi-LOS), snapshot 2 =
+   the next scenario (UMi-NLOS), ... : 10 snapshots per set, 30 for all three sets, one scenario per snapshot.
+2. Build the noise-normalised channels from those rows (dataset_channels.py).
+3. From the 10 users of the snapshot choose the QAOA subproblem: the number of users, beams and RF chains you
+   typed. Greedy, OMP, QAOA and the exact optimum all solve exactly this subproblem.
+4. Write everything into a NEW folder  results/run_<date>_<time>_<backend>_<users>u<beams>b<rf>rf/
+   (older runs are never overwritten):
+       Set1_..., Set2_..., Set3_... .pdf   one 7-inch wide figure per set: gain | interference | fairness
+       qaoa_dataset_results.csv           every number of every snapshot and method
+       run_info.txt                       the settings of the run
 
 Units: the channel is noise-normalised (noise power = 1, transmit power already inside H), so the
 interference graph is interference-to-noise ratio in dB: 0 dB = interference equals the noise.
@@ -52,8 +57,8 @@ import dataset_channels as dc
 
 DATA_FILE = "channel_test_suite_organized.xlsx"
 DATA_SELECTION = "all"        # "all", "Set 1", "Set 2" or "Set 3"
-SNAPSHOTS_PER_SET = 10        # snapshots drawn per set ("all" = 3 sets -> 30 snapshots)
-K_DROP = 8                    # users drawn per snapshot (raised automatically if you ask for more users)
+SNAPSHOTS_PER_SET = 10        # snapshots per set, taken in file order (10 = the whole set; "all" = 3 sets -> 30)
+SNAPSHOT_SIZE = 10            # consecutive spreadsheet rows (= users) in one snapshot; a scenario has 10 rows
 POOL_MODE = "mixed"           # which users of the snapshot form the subproblem:
                               #   "mixed"  : strongest user + its nearest-angle neighbours, rest far away in angle
                               #   "crowded": strongest user + nearest-angle neighbours only
@@ -65,7 +70,7 @@ SHADOWING = True              # the spreadsheet path loss has no shadow fading, 
 PATHLOSS_SOURCE = "dataset"   # "dataset" (spreadsheet column) or "model" (your path_loss_db())
 TX_DBM, BW_HZ, NF_DB = 30.0, 100e6, 9.0
 MASTER_SEED = 0
-RESULTS_CSV = "qaoa_dataset_results.csv"
+RESULTS_CSV = "qaoa_dataset_results.csv"      # written into the run folder, never overwritten
 
 MAX_QUBITS = 20               # dense simulation limit of the circuit backends
 MAX_FEASIBLE_STATES = 2_000_000   # limit of the "statevector" backend (weight-R subspace size C(users*beams, R))
@@ -108,6 +113,9 @@ def check_choice(users, beams, rf):
         return False, "users, beams and RF chains must all be at least 1."
     if rf > users:
         return False, f"RF chains ({rf}) cannot be more than users ({users})."
+    if users > SNAPSHOT_SIZE:
+        return False, (f"{users} users is more than the {SNAPSHOT_SIZE} users (spreadsheet rows) "
+                       f"of one snapshot. Use at most {SNAPSHOT_SIZE}.")
     q = users * beams
     if base.QUANTUM and q > MAX_QUBITS:
         return False, (f"{users} users x {beams} beams = {q} qubits is more than the {MAX_QUBITS}-qubit "
@@ -190,11 +198,39 @@ def get_choice(args, n_snapshots_fn):
 # SNAPSHOTS AND SUBPROBLEM
 # ======================================================
 
-def build_snapshots(k_drop, selection, per_set):
+def build_snapshots(selection, per_set):
+    """
+    Sequential snapshots. For every chosen set the rows are taken in file order, SNAPSHOT_SIZE at a time:
+    snapshot 1 = rows 1-10 (first scenario), snapshot 2 = rows 11-20 (next scenario), ...
+    """
     rng = np.random.default_rng(MASTER_SEED)
     df = dc.load_dataset(DATA_FILE)
-    sets = dc.choose_sets(df, selection)
-    snaps = dc.draw_snapshots(sets, per_set, k_drop, rng)
+    for col in ("set", "N", "R", "scenario", "fc_GHz"):
+        if col not in df.columns:
+            raise ValueError(f"column '{col}' not found in the dataset; columns are: {list(df.columns)}")
+    if "instance_id" in df.columns:
+        df = df.sort_values("instance_id", kind="stable")
+    df = df.reset_index(drop=True)
+
+    names = list(dict.fromkeys(df["set"]))                       # sets in file order
+    if selection != "all":
+        key = lambda t: str(t).lower().replace(" ", "")
+        names = [n for n in names if key(n) == key(selection)]
+        if not names:
+            raise ValueError(f"set '{selection}' not found; available: {list(dict.fromkeys(df['set']))}")
+
+    snaps = []
+    for name in names:
+        sub = df[df["set"] == name].reset_index(drop=True)
+        n_max = len(sub) // SNAPSHOT_SIZE
+        n_take = min(per_set, n_max)
+        if per_set > n_max:
+            print(f"  note: {name} has only {n_max} snapshots of {SNAPSHOT_SIZE} rows, using {n_max}.")
+        for j in range(n_take):
+            rows = sub.iloc[j * SNAPSHOT_SIZE:(j + 1) * SNAPSHOT_SIZE].reset_index(drop=True)
+            scen = list(dict.fromkeys(rows["scenario"]))
+            snaps.append(dict(set=name, N=int(rows["N"].iloc[0]), R=int(rows["R"].iloc[0]), rows=rows,
+                              scenario=scen[0] if len(scen) == 1 else "/".join(map(str, scen))))
     for i, s in enumerate(snaps):
         H, info = dc.generate_channels_from_rows(
             s["rows"], s["N"], rng, n_chains=base.N_RF_SUB, tx_dbm=TX_DBM, bw_hz=BW_HZ,
@@ -259,7 +295,7 @@ def make_build_subproblem(snaps):
         s = snaps[i]
         F = codebook(s["N"], s["fc"])
         H = s["H"]
-        G = np.abs(H @ F) ** 2                                     # (K_DROP, n_beams)
+        G = np.abs(H @ F) ** 2                                     # (SNAPSHOT_SIZE, n_beams)
         rng = np.random.default_rng(MASTER_SEED + i)
         users = select_pool(G, s["info"]["sin_los"], base.K_SUB, POOL_MODE, rng)
         cand = candidate_beams_distinct(G, F, users, base.M_CAND, CAND_RHO)
@@ -289,13 +325,13 @@ if __name__ == "__main__":
     n_sets = 3 if selection == "all" else 1
 
     users, beams, rf = get_choice(args, lambda u: per_set * n_sets)
+    base.RUN_TAG = f"{users}u{beams}b{rf}rf"                    # goes into the run-folder name
 
     # apply the choice to the shared QAOA code
     base.K_SUB, base.M_CAND, base.N_RF_SUB = users, beams, rf
     base.N_RESTARTS = retries_for(users * beams)
-    k_drop = max(K_DROP, users)
 
-    snaps = build_snapshots(k_drop, selection, per_set)
+    snaps = build_snapshots(selection, per_set)
 
     # noise-normalised channel: noise power 1, transmit power already inside H
     base.NOISE_POWER = 1.0
@@ -303,20 +339,32 @@ if __name__ == "__main__":
     base.build_subproblem = make_build_subproblem(snaps)
     base.OUTPUT_TAG = "_dataset"
     base.RUN_LABEL = "snapshots"
-    base.GROUP_LABELS = [s["set"] for s in snaps]
+    base.GROUP_LABELS = [s["set"] for s in snaps]              # one PDF per set
+    base.X_LABELS = [s["scenario"] for s in snaps]             # x ticks of the paper figures
     base.INTERF_YLABEL = "Interference-to-noise ratio (dB)"
+    base.INTERF_YLABEL_SHORT = "Interference-to-noise (dB)"
     base.INTERF_TITLE = "Mean interference per user vs noise (dB, 0 = noise level), lower is better"
 
     qubits = users * beams
-    print(f"\nData: {DATA_FILE} | selection: {selection} | {len(snaps)} snapshots of {k_drop} users | "
-          f"pool: {POOL_MODE} | codebook: {CODEBOOK} | shadowing: {SHADOWING}")
+    print(f"\nData: {DATA_FILE} | selection: {selection} | {len(snaps)} sequential snapshots of "
+          f"{SNAPSHOT_SIZE} users | pool: {POOL_MODE} | codebook: {CODEBOOK} | shadowing: {SHADOWING}")
+    out_dir = base.run_dir()
+    print(f"Results of this run go to: {out_dir}")
+    with open(out_dir / "run_info.txt", "w") as f:
+        f.write(f"data file       : {DATA_FILE}\nselection       : {selection}\n"
+                f"snapshots       : {len(snaps)} x {SNAPSHOT_SIZE} users (sequential)\n"
+                f"subproblem      : {users} users x {beams} beams = {qubits} qubits, {rf} RF chains\n"
+                f"backend         : {base.BACKEND}, p = {base.P_DEPTH}, mixer = {base.MIXER} ({base.MIXER_GRAPH})\n"
+                f"pool / codebook : {POOL_MODE} / {CODEBOOK}, shadowing {SHADOWING}\n"
+                f"objective       : {base.OBJECTIVE}, MU = {base.MU}, penalty = {base.PENALTY_FACTOR}\n")
     print(f"Backend: {base.BACKEND} | subproblem: {users} users x {beams} beams, {rf} RF chains "
           f"= {qubits} qubits | p = {base.P_DEPTH} | mixer = {base.MIXER} ({base.MIXER_GRAPH})")
 
     all_res, all_extra, rows = [], [], []
     for i, s in enumerate(snaps):
         print("\n" + "=" * 60)
-        print(f"SNAPSHOT {i}: {s['set']} (N = {s['N']} antennas, R = {s['R']} RF chains in the dataset)")
+        print(f"SNAPSHOT {i + 1}/{len(snaps)}: {s['set']}, scenario {s['scenario']} "
+              f"(N = {s['N']} antennas, R = {s['R']} RF chains in the dataset)")
         print("  scenarios:", ", ".join(s["info"]["scenario"]))
         results, extra = base.run_seed(i)
         all_res.append(results)
@@ -331,7 +379,7 @@ if __name__ == "__main__":
             r = results[name]
             print(f"  {name:8s} SINR={r['sinr_db']:.2f} dB  interf={r['mean_interf_db']:.2f} dB  "
                   f"Jain={r['jain']:.3f}  SE={r['se']:.3f}")
-            rows.append(dict(snapshot=i, set=s["set"], N=s["N"], users=users, beams=beams, rf_chains=rf,
+            rows.append(dict(snapshot=i + 1, set=s["set"], scenario=s["scenario"], N=s["N"], users=users, beams=beams, rf_chains=rf,
                              qubits=qubits, method=name, sinr_db=r["sinr_db"],
                              interference_db=r["mean_interf_db"], jain=r["jain"], sum_se=r["se"],
                              min_user_se=r["min_se"], scenarios="|".join(s["info"]["scenario"])))
@@ -351,8 +399,10 @@ if __name__ == "__main__":
     print(f"QAOA found the exact optimum in "
           f"{sum(e['qaoa_matches_opt'] for e in all_extra)}/{len(snaps)} snapshots")
 
-    pd.DataFrame(rows).to_csv(RESULTS_CSV, index=False)
-    print(f"Per-snapshot results saved to {RESULTS_CSV}")
+    csv_path = out_dir / RESULTS_CSV
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    print(f"Per-snapshot results saved to {csv_path}")
 
-    base.plot_three(all_res)
+    for path in base.plot_paper_figures(all_res):
+        print(f"Figure saved to {path}")
     plt.show()

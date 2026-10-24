@@ -25,15 +25,19 @@ In all backends the cost Hamiltonian comes from the QUBO -> Ising mapping
 of Eqs. (10)-(12); the mapping is verified numerically on random bit strings
 and on every state of the feasible-weight subspace.
 
-Figures written (Greedy / OMP / QAOA-XY only):
-    qaoa_gain_<backend>.png          total gain of the selected beams (dB)
-    qaoa_interference_<backend>.png  mean interference power per user (dB)
-    qaoa_fairness_<backend>.png      Jain's fairness index
+Figures written (Greedy / OMP / QAOA-XY only), always into a NEW sub-folder
+results/run_<date>_<time>_<backend>_<tag>/ so earlier runs are never overwritten:
+    plot_paper_figures : one PDF per group (e.g. per data set), the three panels
+                         gain | interference | fairness side by side, 7 in wide
+    plot_three         : three separate PNG line charts (seed mode)
 """
 
 import itertools
 import numpy as np
+import matplotlib as mpl
 import matplotlib.pyplot as plt
+from datetime import datetime
+from pathlib import Path
 from scipy import sparse
 from scipy.sparse.linalg import expm_multiply
 from scipy.optimize import minimize
@@ -123,8 +127,87 @@ GROUP_LABELS = None                                  # optional: one label per r
                                                      # line is drawn wherever the label changes
 INTERF_YLABEL = "Interference (dB)"
 INTERF_TITLE = "Mean interference power per user (dB), lower is better"
+INTERF_YLABEL_SHORT = "Interference (dB)"            # y label of the narrow paper panel
+
+# ---- output folder: every run gets its own sub-folder, nothing is ever overwritten ----
+RESULTS_ROOT = "results"        # created next to this script
+RUN_TAG = ""                    # extra text in the run-folder name (the dataset script puts users/beams/RF there)
+
+# ---- paper figures (ICC / IEEE two-column paper) ----
+X_LABELS = None                 # one x tick label per run (the dataset script uses the scenario names)
+SAVE_FORMATS = ("pdf",)         # add "png" to also get a PNG of every paper figure
+PAPER_FIG_WIDTH_IN = 7.0        # full text width of a two-column paper (use figure* in LaTeX)
+PAPER_FIG_HEIGHT_IN = 2.35      # three equal panels of about 2.2 in each side by side
+PAPER_MARKER_SIZE = 2.5         # explicit marker size (rcParams value of 0.75 pt would be invisible)
+MARKERS = {"Greedy": "o", "OMP": "s", "QAOA-XY": "^", "Optimal": "D"}
+LINESTYLES = {"Greedy": "--", "OMP": ":", "QAOA-XY": "-", "Optimal": "-."}
 COLORS = {"Greedy": "tab:blue", "OMP": "tab:orange",
           "QAOA-XY": "tab:green", "Optimal": "tab:red"}
+
+
+# ======================================================
+# OUTPUT FOLDER AND PAPER STYLE
+# ======================================================
+
+_RUN_DIR = None
+
+
+def run_dir():
+    """
+    Folder of the current run, created on first use:
+        <script folder>/results/run_<YYYYmmdd_HHMMSS>_<backend>[_<RUN_TAG>]/
+    The name carries the start time, so a new run never overwrites an old one
+    (a numeric suffix is added in the unlikely case the name already exists).
+    """
+    global _RUN_DIR
+    if _RUN_DIR is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = f"run_{stamp}_{BACKEND}" + (f"_{RUN_TAG}" if RUN_TAG else "")
+        root = Path(__file__).resolve().parent / RESULTS_ROOT
+        d, k = root / name, 1
+        while d.exists():
+            d = root / f"{name}_{k}"
+            k += 1
+        d.mkdir(parents=True)
+        _RUN_DIR = d
+    return _RUN_DIR
+
+
+def paper_style():
+    """Matplotlib settings for figures that go into the paper (Times New Roman, small fonts, 600 dpi)."""
+    mpl.rcParams.update({
+        # Base font (falls back to the next installed Times-like font if Times New Roman is missing)
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Times", "Nimbus Roman", "Liberation Serif", "DejaVu Serif"],
+        "mathtext.fontset": "stix",
+
+        "font.size": 8,
+        "axes.titlesize": 9,
+        "axes.labelsize": 8,
+        "xtick.labelsize": 7,
+        "ytick.labelsize": 7,
+        "legend.fontsize": 7,
+
+        # Axes
+        "axes.linewidth": 0.5,
+
+        # Ticks
+        "xtick.major.width": 0.5,
+        "ytick.major.width": 0.5,
+
+        # Legend
+        "legend.framealpha": 0.9,
+
+        # Lines and markers
+        "lines.linewidth": 0.75,
+        "lines.markersize": 0.75,
+
+        # Saving
+        "savefig.dpi": 600,
+        "savefig.bbox": "tight",
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    })
 
 
 # ======================================================
@@ -713,7 +796,7 @@ def mu_sweep(mus, seeds):
         ax.set_title(title)
         ax.legend()
     fig.tight_layout()
-    fig.savefig(f"qaoa_mu_tradeoff_{POOL_MODE}.png", dpi=300)
+    fig.savefig(run_dir() / f"qaoa_mu_tradeoff_{POOL_MODE}.png", dpi=300)
 
 
 # ======================================================
@@ -780,19 +863,77 @@ def plot_three(all_res):
               f"Total beamforming gain of the selected beams per {RUN_LABEL.rstrip('s')}, higher is better\n{setup}",
               "Total gain (linear)")
     fig1.tight_layout()
-    fig1.savefig(f"qaoa_gain_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
+    fig1.savefig(run_dir() / f"qaoa_gain_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
 
     fig2, ax2 = plt.subplots(figsize=size)
     _line(ax2, all_res, "mean_interf_db", f"{INTERF_TITLE}\n{setup}", INTERF_YLABEL)
     fig2.tight_layout()
-    fig2.savefig(f"qaoa_interference_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
+    fig2.savefig(run_dir() / f"qaoa_interference_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
 
     fig3, ax3 = plt.subplots(figsize=size)
     _line(ax3, all_res, "jain", f"Jain's fairness index per {RUN_LABEL.rstrip('s')}, higher is better\n{setup}",
           "Jain's index")
     ax3.set_ylim(0, 1.1)
     fig3.tight_layout()
-    fig3.savefig(f"qaoa_fairness_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
+    fig3.savefig(run_dir() / f"qaoa_fairness_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
+
+
+def plot_paper_figures(all_res, groups=None, xlabels=None):
+    """
+    One PDF per group (for the dataset script: one per data set = 10 snapshots = 10 scenarios).
+    Every PDF is 7 in wide and holds three equal panels side by side:
+        (a) total beam gain (dB)   (b) interference (dB)   (c) Jain's fairness index
+    x axis = one point per run (snapshot), labelled with xlabels (scenario names).
+    Files go into the run folder and are never overwritten by a later run.
+    Returns the list of written files.
+    """
+    paper_style()
+    n = len(all_res)
+    groups = GROUP_LABELS if groups is None else groups
+    xlabels = X_LABELS if xlabels is None else xlabels
+    if groups is None or len(groups) != n:
+        groups = [RUN_LABEL.rstrip("s").capitalize()] * n
+    written = []
+    for g in dict.fromkeys(groups):                       # groups in order of appearance
+        idx = [i for i in range(n) if groups[i] == g]
+        res = [all_res[i] for i in idx]
+        labels = ([str(xlabels[i]) for i in idx] if xlabels is not None and len(xlabels) == n
+                  else [str(k + 1) for k in range(len(idx))])
+        fig = _paper_figure(res, labels)
+        stem = f"{str(g).replace(' ', '')}_{K_SUB}u{M_CAND}b{N_RF_SUB}rf_{BACKEND}"
+        for ext in SAVE_FORMATS:
+            path = run_dir() / f"{stem}.{ext}"
+            fig.savefig(path, pad_inches=0.02)       # tight box with a thin margin: the file stays within 7 in
+            written.append(path)
+    return written
+
+
+def _paper_figure(res, labels):
+    """Three panels (gain | interference | fairness), PAPER_FIG_WIDTH_IN wide, one third each."""
+    fig, axes = plt.subplots(1, 3, figsize=(PAPER_FIG_WIDTH_IN, PAPER_FIG_HEIGHT_IN),
+                             gridspec_kw=dict(wspace=0.42))
+    fig.subplots_adjust(left=0.065, right=0.995, top=0.86, bottom=0.30)
+    x = np.arange(1, len(res) + 1)
+    to_db = (lambda g: 10 * np.log10(max(g, 1e-30))) if GAIN_IN_DB else None
+    panels = [("gain", "(a) Total beam gain", "Gain (dB)" if GAIN_IN_DB else "Gain", to_db),
+              ("mean_interf_db", "(b) Interference", INTERF_YLABEL_SHORT, None),
+              ("jain", "(c) Fairness", "Jain's index", None)]
+    for ax, (key, title, ylabel, fn) in zip(axes, panels):
+        for mth in PLOT_METHODS:
+            y = [(fn(r[mth][key]) if fn else r[mth][key]) for r in res]
+            ax.plot(x, y, color=COLORS[mth], marker=MARKERS.get(mth, "o"),
+                    markersize=PAPER_MARKER_SIZE, linestyle=LINESTYLES.get(mth, "-"), label=mth)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=90)
+        ax.set_xlim(0.5, len(res) + 0.5)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, linewidth=0.3, alpha=0.5)
+    axes[2].set_ylim(top=1.02)
+    handles, names = axes[0].get_legend_handles_labels()
+    fig.legend(handles, names, loc="lower center", bbox_to_anchor=(0.5, 0.93), ncol=len(names),
+               frameon=True, borderpad=0.3, columnspacing=1.5, handlelength=2.0)
+    return fig
 
 
 def draw_circuit(qc, params=None):
