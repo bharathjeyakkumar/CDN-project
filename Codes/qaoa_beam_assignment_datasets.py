@@ -17,6 +17,7 @@ HOW TO RUN
 
 Needs, in the same folder:
     qaoa_beam_assignment.py   (QUBO, QAOA circuit, metrics, plots; nothing of it is duplicated here)
+    plotter.py                (figures from the results CSV; also runnable on its own)
     dataset_channels.py       (spreadsheet loader + channel generation)
     channels.py               (your channel model and codebooks)
     qaoa_pennylane.py (or qaoa_circuit.py), step1_greedy.py, step1_omp.py, compute_sinr.py
@@ -32,9 +33,11 @@ What one run does
    typed. Greedy, OMP, QAOA and the exact optimum all solve exactly this subproblem.
 4. Write everything into a NEW folder  results/run_<date>_<time>_<backend>_<users>u<beams>b<rf>rf/
    (older runs are never overwritten):
-       Set1_..., Set2_..., Set3_... .pdf   one 7-inch wide figure per set: gain | interference | fairness
-       qaoa_dataset_results.csv           every number of every snapshot and method
+       qaoa_dataset_results.csv           every number of every snapshot and method (gain, SINR, interference, ...)
+       Set1_..., Set2_..., Set3_... .pdf   one 7-inch wide figure per set: gain | interference | fairness,
+                                          drawn by plotter.py from the CSV above (NOT from variables of this script)
        run_info.txt                       the settings of the run
+   To change the look of the figures, edit plotter.py and run it again on the CSV; no simulation is repeated.
 
 Units: the channel is noise-normalised (noise power = 1, transmit power already inside H), so the
 interference graph is interference-to-noise ratio in dB: 0 dB = interference equals the noise.
@@ -49,6 +52,7 @@ import matplotlib.pyplot as plt
 
 import qaoa_beam_assignment as base
 import dataset_channels as dc
+import plotter
 
 
 # ======================================================
@@ -337,13 +341,6 @@ if __name__ == "__main__":
     base.NOISE_POWER = 1.0
     base.TX_POWER_PER_STREAM_W = 1.0
     base.build_subproblem = make_build_subproblem(snaps)
-    base.OUTPUT_TAG = "_dataset"
-    base.RUN_LABEL = "snapshots"
-    base.GROUP_LABELS = [s["set"] for s in snaps]              # one PDF per set
-    base.X_LABELS = [s["scenario"] for s in snaps]             # x ticks of the paper figures
-    base.INTERF_YLABEL = "Interference-to-noise ratio (dB)"
-    base.INTERF_YLABEL_SHORT = "Interference-to-noise (dB)"
-    base.INTERF_TITLE = "Mean interference per user vs noise (dB, 0 = noise level), lower is better"
 
     qubits = users * beams
     print(f"\nData: {DATA_FILE} | selection: {selection} | {len(snaps)} sequential snapshots of "
@@ -380,7 +377,9 @@ if __name__ == "__main__":
             print(f"  {name:8s} SINR={r['sinr_db']:.2f} dB  interf={r['mean_interf_db']:.2f} dB  "
                   f"Jain={r['jain']:.3f}  SE={r['se']:.3f}")
             rows.append(dict(snapshot=i + 1, set=s["set"], scenario=s["scenario"], N=s["N"], users=users, beams=beams, rf_chains=rf,
-                             qubits=qubits, method=name, sinr_db=r["sinr_db"],
+                             qubits=qubits, backend=base.BACKEND, method=name,
+                             gain_linear=r["gain"], gain_db=10 * np.log10(max(r["gain"], 1e-30)),
+                             sinr_db=r["sinr_db"],
                              interference_db=r["mean_interf_db"], jain=r["jain"], sum_se=r["se"],
                              min_user_se=r["min_se"], scenarios="|".join(s["info"]["scenario"])))
 
@@ -403,6 +402,9 @@ if __name__ == "__main__":
     pd.DataFrame(rows).to_csv(csv_path, index=False)
     print(f"Per-snapshot results saved to {csv_path}")
 
-    for path in base.plot_paper_figures(all_res):
+    # ---------- figures: drawn by plotter.py from the CSV that was just stored ----------
+    # (the data comes back from the file, not from the variables of this script)
+    paths, _ = plotter.plot_from_csv(csv_path, out_dir=out_dir, close=False)
+    for path in paths:
         print(f"Figure saved to {path}")
     plt.show()

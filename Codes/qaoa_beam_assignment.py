@@ -877,35 +877,148 @@ def plot_three(all_res):
     fig3.tight_layout()
     fig3.savefig(run_dir() / f"qaoa_fairness_{BACKEND}{OUTPUT_TAG}.png", dpi=300)
 
-
 def plot_paper_figures(all_res, groups=None, xlabels=None):
     """
-    One PDF per group (for the dataset script: one per data set = 10 snapshots = 10 scenarios).
-    Every PDF is 7 in wide and holds three equal panels side by side:
-        (a) total beam gain (dB)   (b) interference (dB)   (c) Jain's fairness index
-    x axis = one point per run (snapshot), labelled with xlabels (scenario names).
-    Files go into the run folder and are never overwritten by a later run.
-    Returns the list of written files.
+    Generate three separate PDF graphs per group:
+        1. Gain
+        2. Interference
+        3. Fairness
+
+    Each graph contains one point per snapshot and three methods:
+        Greedy, OMP, QAOA-XY
+
+    The mean of each method is displayed in the legend.
+
+    For 3 groups, this produces 9 PDFs.
     """
     paper_style()
+
     n = len(all_res)
+
     groups = GROUP_LABELS if groups is None else groups
     xlabels = X_LABELS if xlabels is None else xlabels
+
     if groups is None or len(groups) != n:
         groups = [RUN_LABEL.rstrip("s").capitalize()] * n
+
     written = []
-    for g in dict.fromkeys(groups):                       # groups in order of appearance
-        idx = [i for i in range(n) if groups[i] == g]
+
+    # One graph per metric.
+    metrics = [
+        {
+            "key": "gain",
+            "name": "Gain",
+            "ylabel": "Total gain (dB)" if GAIN_IN_DB else "Total gain",
+            "title": "Total beamforming gain",
+            "transform": (
+                lambda g: 10 * np.log10(max(g, 1e-30))
+                if GAIN_IN_DB else g
+            ),
+        },
+        {
+            "key": "mean_interf_db",
+            "name": "Interference",
+            "ylabel": INTERF_YLABEL_SHORT,
+            "title": INTERF_TITLE,
+            "transform": None,
+        },
+        {
+            "key": "jain",
+            "name": "Fairness",
+            "ylabel": "Jain's fairness index",
+            "title": "Jain's fairness index",
+            "transform": None,
+        },
+    ]
+
+    # Process each group independently.
+    for group in dict.fromkeys(groups):
+
+        # Select snapshots belonging to this group.
+        idx = [i for i in range(n) if groups[i] == group]
+
         res = [all_res[i] for i in idx]
-        labels = ([str(xlabels[i]) for i in idx] if xlabels is not None and len(xlabels) == n
-                  else [str(k + 1) for k in range(len(idx))])
-        fig = _paper_figure(res, labels)
-        stem = f"{str(g).replace(' ', '')}_{K_SUB}u{M_CAND}b{N_RF_SUB}rf_{BACKEND}"
-        for ext in SAVE_FORMATS:
-            path = run_dir() / f"{stem}.{ext}"
-            fig.savefig(path, pad_inches=0.02)       # tight box with a thin margin: the file stays within 7 in
-            written.append(path)
+
+        labels = (
+            [str(xlabels[i]) for i in idx]
+            if xlabels is not None and len(xlabels) == n
+            else [str(k + 1) for k in range(len(idx))]
+        )
+
+        # Produce three separate graphs for this group.
+        for metric in metrics:
+
+            fig, ax = plt.subplots(figsize=(7.0, 3.8))
+
+            x = np.arange(1, len(res) + 1)
+
+            # Plot Greedy, OMP and QAOA-XY.
+            for method in PLOT_METHODS:
+
+                values = np.array([
+                    (
+                        metric["transform"](r[method][metric["key"]])
+                        if metric["transform"] is not None
+                        else r[method][metric["key"]]
+                    )
+                    for r in res
+                ], dtype=float)
+
+                # Mean across the snapshots in this group.
+                mean_value = float(np.mean(values))
+
+                ax.plot(
+                    x,
+                    values,
+                    color=COLORS[method],
+                    marker=MARKERS.get(method, "o"),
+                    markersize=4,
+                    linestyle=LINESTYLES.get(method, "-"),
+                    linewidth=1.2,
+                    label=f"{method} (mean = {mean_value:.3f})",
+                )
+
+            # X-axis: individual snapshots.
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=45, ha="right")
+            ax.set_xlim(0.5, len(res) + 0.5)
+            ax.set_xlabel("Snapshot")
+            ax.set_ylabel(metric["ylabel"])
+
+            # Title identifies the metric and group.
+            ax.set_title(f"{metric['title']} — {group}")
+
+            ax.grid(True, linewidth=0.4, alpha=0.5)
+            ax.legend(loc="best", fontsize=8)
+
+            # Jain's fairness index lies between 0 and 1.
+            if metric["key"] == "jain":
+                ax.set_ylim(0, 1.05)
+
+            fig.tight_layout()
+
+            # Create a unique PDF filename for this group and metric.
+            safe_group = (
+                str(group)
+                .replace(" ", "")
+                .replace("/", "_")
+                .replace("\\", "_")
+            )
+
+            stem = (
+                f"{safe_group}_{metric['name']}_"
+                f"{K_SUB}u{M_CAND}b{N_RF_SUB}rf_{BACKEND}"
+            )
+
+            for ext in SAVE_FORMATS:
+                path = run_dir() / f"{stem}.{ext}"
+                fig.savefig(path, pad_inches=0.03)
+                written.append(path)
+
+            plt.close(fig)
+
     return written
+
 
 
 def _paper_figure(res, labels):
