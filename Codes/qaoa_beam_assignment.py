@@ -40,7 +40,8 @@ from datetime import datetime
 from pathlib import Path
 from scipy import sparse
 from scipy.sparse.linalg import expm_multiply
-from scipy.optimize import minimize
+from scipy.optimize import minimize, milp, LinearConstraint, Bounds
+import time
 
 from beam_dictionary import generate_beam_dictionary
 from channel_model_distance_aware import generate_stress_scenario
@@ -95,6 +96,8 @@ OBJECTIVE = "logsinr"   # "logsinr": first-order linearisation of sum_k -ln(SINR
                         # "legacy" : -gain + MU * leakage in absolute gains          (old)
 MU = 3.0                # weight of the interference term (1 = plain linearisation).
                         # 3 sits at the SINR peak of the sweep; recalibrate with RUN_MU_SWEEP
+USE_FAIRNESS_TERM = True  # add the fairness penalty C_F(k,m) = LAMBDA_F * (G2_km - mean(G2))^2 to the QUBO diagonal
+LAMBDA_F = 0.01         # fairness weight lambda_F (same value is used by QAOA and by the ILP: it is in the QUBO)
 PENALTY_FACTOR = 2.0    # starting weight of constraint penalties, in units of the objective
                         # scale; raised automatically until the QUBO ground state is feasible
 
@@ -117,8 +120,8 @@ RUN_MU_SWEEP = False   # True: first run the cheap exact-QUBO trade-off sweep ov
 MU_GRID = [1, 2, 3, 5, 8, 15]
 
 N_SEEDS = 15
-METHODS = ["Greedy", "OMP", "QAOA-XY", "Optimal"]   # all methods that are evaluated
-PLOT_METHODS = ["Greedy", "OMP", "QAOA-XY"]          # methods shown in the graphs
+METHODS = ["Greedy", "OMP", "QAOA-XY", "ILP"]        # all methods that are evaluated (ILP = exact optimum)
+PLOT_METHODS = ["Greedy", "OMP", "QAOA-XY", "ILP"]   # methods shown in the graphs
 DRAW_CIRCUIT = False                                 # True: also save a drawing of the circuit
 OUTPUT_TAG = ""                                      # appended to the graph file names
 RUN_LABEL = "seeds"                                  # what one run is called in graph titles
@@ -139,10 +142,10 @@ SAVE_FORMATS = ("pdf",)         # add "png" to also get a PNG of every paper fig
 PAPER_FIG_WIDTH_IN = 7.0        # full text width of a two-column paper (use figure* in LaTeX)
 PAPER_FIG_HEIGHT_IN = 2.35      # three equal panels of about 2.2 in each side by side
 PAPER_MARKER_SIZE = 2.5         # explicit marker size (rcParams value of 0.75 pt would be invisible)
-MARKERS = {"Greedy": "o", "OMP": "s", "QAOA-XY": "^", "Optimal": "D"}
-LINESTYLES = {"Greedy": "--", "OMP": ":", "QAOA-XY": "-", "Optimal": "-."}
+MARKERS = {"Greedy": "o", "OMP": "s", "QAOA-XY": "^", "ILP": "D", "Optimal": "D"}
+LINESTYLES = {"Greedy": "--", "OMP": ":", "QAOA-XY": "-", "ILP": "-.", "Optimal": "-."}
 COLORS = {"Greedy": "tab:blue", "OMP": "tab:orange",
-          "QAOA-XY": "tab:green", "Optimal": "tab:red"}
+          "QAOA-XY": "tab:green", "ILP": "tab:red", "Optimal": "tab:red"}
 
 
 # ======================================================
@@ -355,6 +358,19 @@ def build_qubo(G, users, cand, lam=None):
                     P[q(k, s), q(k2, s2)] = MU * (wv[k] * G[users[k], b2]
                                                   + wv[k2] * G[users[k2], b])
 
+    # Fairness penalty (Section 8):  Gbar2 = 1/(K m) sum_(k,m) G2_(k,m),
+    #                                C_F(k,m) = lambda_F * (G2_(k,m) - Gbar2)^2
+    # It depends on one (user, beam) pair only, so it is a linear term = QUBO diagonal.
+    # G2 is the squared gain of the candidate beam, normalised by the strongest candidate
+    # so that lambda_F does not depend on the channel / noise normalisation.
+    if USE_FAIRNESS_TERM and LAMBDA_F != 0:
+        g = np.array([[G[users[k], cand[k, s]] for s in range(m)] for k in range(K)])
+        g2 = (g / g.max()) ** 2
+        CF = LAMBDA_F * (g2 - g2.mean()) ** 2
+        for k in range(K):
+            for s in range(m):
+                D[q(k, s)] += CF[k, s]
+
     # typical cost of serving one user alongside N_RF_SUB - 1 others -> remove it
     # (a constant on every state that serves exactly N_RF_SUB users)
     pair_mean = np.mean([P[i, j] for i, j in itertools.combinations(range(N), 2)
@@ -524,6 +540,76 @@ def run_qaoa_statevector(E, mix, p, restarts, rng):
             best = res
     prob = np.abs(qaoa_state(best.x, E, mix, MIXER)) ** 2
     return best, prob / prob.sum()
+
+
+# ======================================================
+# 3b. ILP: EXACT OPTIMUM OF THE SAME OBJECTIVE
+# ======================================================
+
+def ilp_assignment(G, users, cand, n_rf):
+    """
+    Integer linear program with exactly the coefficients of the QUBO (including the
+    fairness term C_F), solved to global optimality (HiGHS branch and bound).
+
+    The QUBO energy x^T Q x = sum_i Q_ii x_i + 2 sum_{i<j} Q_ij x_i x_j is linearised with
+    one auxiliary variable y_ij = x_i x_j per coupled pair:
+        Q_ij > 0 : y_ij >= x_i + x_j - 1          (y_ij >= 0)
+        Q_ij < 0 : y_ij <= x_i,  y_ij <= x_j
+    The constraints that the QUBO only penalises are HARD constraints here:
+        sum_i x_i = N_RF                          (RF chains)
+        sum_s x_{k,s} <= 1  for every user k      (at most one beam per user)
+        sum x_{k,s} <= 1    over all (k,s) with the same beam   (one user per beam)
+    so the penalty weight is not needed (Q is built with lam = 0).
+
+    Returns (assignment as list of (user, beam), objective value, solve time in s).
+    """
+    K, m = cand.shape
+    N = K * m
+    Q, offset = build_qubo(G, users, cand, lam=0.0)
+    pairs = [(i, j) for i in range(N) for j in range(i + 1, N) if Q[i, j] != 0.0]
+    n_var = N + len(pairs)
+
+    c = np.zeros(n_var)
+    c[:N] = np.diag(Q)
+    for t, (i, j) in enumerate(pairs):
+        c[N + t] = 2.0 * Q[i, j]
+
+    rows, lo, hi = [], [], []
+
+    def add(coefs, lb, ub):
+        rows.append(coefs)
+        lo.append(lb)
+        hi.append(ub)
+
+    add({i: 1.0 for i in range(N)}, n_rf, n_rf)                       # exactly N_RF assignments
+    for k in range(K):                                                # at most one beam per user
+        add({k * m + s: 1.0 for s in range(m)}, 0, 1)
+    for b in np.unique(cand):                                         # at most one user per beam
+        idx = [k * m + s for k in range(K) for s in range(m) if cand[k, s] == b]
+        if len(idx) > 1:
+            add({i: 1.0 for i in idx}, 0, 1)
+    for t, (i, j) in enumerate(pairs):                                # y_ij = x_i x_j
+        y = N + t
+        if Q[i, j] > 0:
+            add({y: 1.0, i: -1.0, j: -1.0}, -1.0, np.inf)
+        else:
+            add({y: 1.0, i: -1.0}, -np.inf, 0.0)
+            add({y: 1.0, j: -1.0}, -np.inf, 0.0)
+
+    A = sparse.lil_matrix((len(rows), n_var))
+    for r, coefs in enumerate(rows):
+        for col, v in coefs.items():
+            A[r, col] = v
+
+    t0 = time.perf_counter()
+    res = milp(c, constraints=LinearConstraint(A.tocsr(), lo, hi),
+               integrality=np.r_[np.ones(N), np.zeros(len(pairs))],   # y follows from x, so it may stay continuous
+               bounds=Bounds(np.zeros(n_var), np.ones(n_var)))
+    dt = time.perf_counter() - t0
+    if not res.success:
+        raise RuntimeError(f"ILP failed: {res.message}")
+    chosen = np.flatnonzero(res.x[:N] > 0.5)
+    return decode(chosen, users, cand), float(res.fun + offset), dt
 
 
 # ======================================================
@@ -709,7 +795,13 @@ def run_seed(seed):
     feas_idx = [i for i in range(len(E))
                 if is_feasible(decode(states[i], users, cand))]
     opt_i = min(feas_idx, key=lambda i: E[i])
-    opt_assign = decode(states[opt_i], users, cand)
+    opt_assign = decode(states[opt_i], users, cand)      # brute force; only used to check QAOA and the ILP
+
+    # ------------------ ILP: exact optimum of the same objective ------------------
+    ilp_assign, ilp_obj, ilp_time = ilp_assignment(G, users, cand, N_RF_SUB)
+    assert is_feasible(ilp_assign), "ILP returned an infeasible assignment"
+    assert abs(ilp_obj - E[opt_i]) < 1e-6, \
+        f"ILP objective {ilp_obj:.6f} differs from the brute-force optimum {E[opt_i]:.6f}"
 
     # ------------------ Greedy / OMP on the SAME subproblem ------------------
     ubeams = np.unique(cand)
@@ -720,7 +812,7 @@ def run_seed(seed):
     omp_assign = [(int(users[k]), int(ubeams[m])) for k, m in o_a]
 
     assigns = {"Greedy": greedy_assign, "OMP": omp_assign,
-               "QAOA-XY": qaoa_assign, "Optimal": opt_assign}
+               "QAOA-XY": qaoa_assign, "ILP": ilp_assign}
     results = {n: evaluate(a, H_users, beam_dict, G) for n, a in assigns.items()}
 
     extra.update(
@@ -732,6 +824,7 @@ def run_seed(seed):
         p_uniform=1.0 / len(E),
         measured_feasible=measured_ok,
         qaoa_matches_opt=set(qaoa_assign) == set(opt_assign),
+        ilp_obj=ilp_obj, ilp_time=ilp_time,
     )
     return results, extra
 

@@ -353,7 +353,9 @@ if __name__ == "__main__":
                 f"subproblem      : {users} users x {beams} beams = {qubits} qubits, {rf} RF chains\n"
                 f"backend         : {base.BACKEND}, p = {base.P_DEPTH}, mixer = {base.MIXER} ({base.MIXER_GRAPH})\n"
                 f"pool / codebook : {POOL_MODE} / {CODEBOOK}, shadowing {SHADOWING}\n"
-                f"objective       : {base.OBJECTIVE}, MU = {base.MU}, penalty = {base.PENALTY_FACTOR}\n")
+                f"objective       : {base.OBJECTIVE}, MU = {base.MU}, penalty = {base.PENALTY_FACTOR}\n"
+                f"fairness term   : {base.USE_FAIRNESS_TERM}, lambda_F = {base.LAMBDA_F}\n"
+                f"methods         : {', '.join(base.METHODS)}\n")
     print(f"Backend: {base.BACKEND} | subproblem: {users} users x {beams} beams, {rf} RF chains "
           f"= {qubits} qubits | p = {base.P_DEPTH} | mixer = {base.MIXER} ({base.MIXER_GRAPH})")
 
