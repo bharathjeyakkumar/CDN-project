@@ -72,6 +72,12 @@ def check_methods():
         np.testing.assert_allclose(metrics["gain_linear"],sum(G[k,b] for k,b in chosen))
         np.testing.assert_allclose(metrics["fairness"],sum(
             0.01*(G[k,b]-candidate_gain.mean())**2 for k,b in chosen))
+    # Every source user has a row, and contributions add to snapshot totals.
+    details = base.evaluate(ilp,H,F,G,users,candidate)["user_contributions"]
+    assert len(details) == 4
+    assert sum(int(d["served"]) for d in details) == 2
+    for metric in ("gain_linear", "interference_linear", "fairness"):
+        np.testing.assert_allclose(sum(d[metric] for d in details), metrics[metric])
     assert all(b in candidate[k] for k,b in ilp)
     physical=physical_components([(k,int(np.where(candidate[k]==b)[0][0])) for k,b in ilp],
              candidate_gain,candidate_beams=candidate,cross_gains=G)
@@ -102,7 +108,21 @@ def check_spreadsheet_and_plots():
         assert len(means)==40 and set(means["source_rows"])=={20}
         assert set(means["snapshot_count"])=={2}
         first=means[(means.scenario=="UMi-LOS")&(means.method=="OMP")].iloc[0]
-        assert first["gain_linear"]==5 and first["interference_linear"]==1
+        assert first["gain_linear"]==0.5 and first["interference_linear"]==0.1
+        # Synthetic source row mapping: 10 users x 2 methods.
+        fake = {method: {"user_contributions": [dict(user=u,
+                    is_candidate_pool=(u < 4), served=(u < 2),
+                    beam=(u+1 if u < 2 else None),
+                    gain_linear=(u+1 if u < 2 else 0.),
+                    interference_linear=(0.5 if u < 2 else 0.),
+                    fairness=(0.1 if u < 2 else 0.)) for u in range(10)],
+                    "table": [dict(rf_chain=u, user=u) for u in range(2)]}
+                for method in datasets.base.METHODS}
+        snap = dict(index=0,set="Set 1",scenario="UMi-LOS",scenario_order=1,
+                    rows=df.iloc[:10])
+        per_user=datasets.make_per_user_records(snap,fake,datasets.base.METHODS)
+        assert len(per_user)==40 and sum(r["served"] for r in per_user)==8
+        assert per_user[0]["gain_linear"]==1 and per_user[9]["gain_linear"]==0
         paths,_=plotter.plot_from_csv(mean_path,out_dir=temp)
         assert len(paths)==6 and all(p.exists() for p in paths)
 

@@ -20,9 +20,9 @@ COLORS = {"Greedy": "tab:blue", "OMP": "tab:orange", "QAOA-XY": "tab:green", "IL
 MARKERS = {"Greedy": "o", "OMP": "s", "QAOA-XY": "^", "ILP": "D"}
 LINESTYLES = {"Greedy": "--", "OMP": ":", "QAOA-XY": "-", "ILP": "-."}
 METRICS = {
-    "gain_linear": ("Gain", "Mean gain (linear power)", "gain"),
-    "interference_linear": ("Interference", "Mean pairwise interference (linear power)", "interference"),
-    "fairness": ("Fairness penalty (lower is better)", "Mean unweighted fairness penalty", "fairness"),
+    "gain_linear": ("Gain", "Mean gain per source row (linear power)", "gain"),
+    "interference_linear": ("Interference", "Mean interference per source row (linear power)", "interference"),
+    "fairness": ("Fairness penalty (lower is better)", "Mean fairness penalty per source row", "fairness"),
 }
 
 
@@ -71,11 +71,22 @@ def plot_from_csv(csv_path, out_dir=None, methods=None, formats=("pdf", "png"), 
                     marker=MARKERS.get(method, "o"),
                     linestyle=LINESTYLES.get(method, "-"), linewidth=1.35,
                     markersize=4.5)
+        # Power-domain metrics can differ by orders of magnitude across scenarios.
+        # Log view for positive data; symlog if any zero/nonpositive value occurs.
+        all_y = df[metric].to_numpy(float)
+        if np.all(all_y > 0):
+            ax.set_yscale("log", base=10)
+        else:
+            positive = all_y[all_y > 0]
+            linthresh = max(float(np.min(positive))*0.1, 1e-12) if len(positive) else 1.0
+            ax.set_yscale("symlog", linthresh=linthresh, base=10)
         ax.set_xticks(xs, scenarios, rotation=35, ha="right")
         ax.set_xlabel("Channel scenario")
         ax.set_ylabel(ylabel)
         ax.set_title(title)
-        ax.grid(axis="y", alpha=0.25, linewidth=0.5)
+        ax.grid(axis="y", which="major", alpha=0.28, linewidth=0.55)
+        ax.grid(axis="y", which="minor", alpha=0.10, linewidth=0.35)
+        ax.margins(y=0.16)
         ax.legend(loc="best", frameon=False, ncol=min(4, len(methods)))
         fig.tight_layout()
         for fmt in formats:

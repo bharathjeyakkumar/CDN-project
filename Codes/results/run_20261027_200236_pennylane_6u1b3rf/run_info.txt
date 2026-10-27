@@ -1,0 +1,10 @@
+dataset: C:\Users\kamle\OneDrive\Desktop\q\qubo\CDN-project\Codes\channel_test_suiteupdated.xlsx
+source rows selected: 200
+snapshots: 20; 10 user rows per snapshot
+channel model requested: auto
+channel model actually used: external
+original workbook lacks R, path_loss_dB, shadow_fading_sigma_dB; simplified mode is NOT the original 3GPP generator
+subproblem: 6 users, 1 beams, 3 RF chains
+QUBO coefficients: gain=1.0, interference=0.5, fairness=0.2, user=6.0, beam=6.0, RF=6.0
+fairness plot is unweighted
+optimiser: PennyLane, depth=2, restarts=4

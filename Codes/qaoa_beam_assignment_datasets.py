@@ -9,9 +9,11 @@ problem's multiuser nature without incorrectly treating individual users as
 independent RF-assignment runs.
 
 Files per run:
-- qaoa_dataset_results.csv: 20 snapshot x 4 method rows = 80 result records.
+- qaoa_dataset_results.csv: 20 snapshot x 4 method rows = 80 total records.
+- qaoa_per_user_results.csv: 200 source rows x 4 methods = 800 rows for a full run.
+  Unserved users contribute ZERO (no assigned beam, received interference or fairness).
 - qaoa_scenario_means.csv: 10 scenario x 4 method = 40 mean records; each
-  scenario mean combines TWO snapshot results covering 20 input rows.
+  scenario mean is (Set 1 TOTAL + Set 2 TOTAL) / 20 source rows.
 - Exactly three plots by plotter.py: linear gain, linear interference, fairness.
 
 The supplied channels.py computes path loss, shadow fading and channel rays
@@ -49,6 +51,7 @@ TX_DBM, BW_HZ, NF_DB = 30.0, 100e6, 9.0
 MASTER_SEED = 0
 RESULTS_CSV = "qaoa_dataset_results.csv"
 MEANS_CSV = "qaoa_scenario_means.csv"
+PER_USER_CSV = "qaoa_per_user_results.csv"
 MAX_QUBITS = 20
 
 
@@ -261,30 +264,61 @@ def make_build_subproblem(snaps, codebook_kind="polar"):
 
 
 def aggregate_scenario_means(snapshot_results, out_path=None):
-    """Write the two-set scenario means using stored snapshot metric values.
+    """Per-SOURCE-ROW metric means: sum of snapshot totals / number of source rows.
 
-    10 rows from each set -> one RF assignment snapshot per set. Each scenario
-    therefore averages two per-snapshot results and represents 20 input rows.
+    For two complete 10-row sets: (Set1_total + Set2_total) / 20.
+    This is NOT the average per RF-served user; unserved source rows count as zero.
+    For a one-set run the denominator is 10 (actual source rows available).
     """
     df = pd.read_csv(snapshot_results) if isinstance(snapshot_results, (str, Path)) else snapshot_results.copy()
     cols = ("gain_linear", "interference_linear", "fairness")
     required = {"scenario_order", "scenario", "method", "set", "source_rows", *cols}
     if required - set(df.columns):
         raise ValueError(f"Missing snapshot CSV columns: {sorted(required-set(df.columns))}")
-    groups = ["scenario_order", "scenario", "method"]
-    # The ONLY aggregation (arithmetic means) happens here, NEVER in plotter.py.
-    averages = df.groupby(groups, sort=False, as_index=False).agg(
-        gain_linear=("gain_linear", "mean"),
-        interference_linear=("interference_linear", "mean"),
-        fairness=("fairness", "mean"),
-        snapshot_count=("snapshot", "nunique"),
-        source_rows=("source_rows", "sum"),
-        sets_combined=("set", lambda s: " | ".join(dict.fromkeys(s))),
-    ).sort_values(["scenario_order", "method"], kind="stable")
+    if df["source_rows"].le(0).any():
+        raise ValueError("source_rows must be strictly positive")
+    output = []
+    for (order, scenario, method), block in df.groupby(
+            ["scenario_order", "scenario", "method"], sort=False):
+        count = int(block["source_rows"].sum())
+        record = dict(scenario_order=order, scenario=scenario, method=method,
+                      snapshot_count=len(block), source_rows=count,
+                      sets_combined=" | ".join(dict.fromkeys(block["set"])))
+        for metric in cols:
+            record[metric] = float(block[metric].sum() / count)
+        output.append(record)
+    averages = pd.DataFrame(output).sort_values(["scenario_order", "method"], kind="stable")
     if out_path is not None:
         averages.to_csv(out_path, index=False)
     return averages
 
+
+def make_per_user_records(snapshot, results, methods):
+    """Map all 10 source dataset rows to their per-user metric contributions."""
+    block = snapshot["rows"].reset_index(drop=True)
+    output = []
+    for method in methods:
+        contributions = results[method]["user_contributions"]
+        if len(contributions) != len(block):
+            raise AssertionError("Per-user metrics must have exactly one row per source row")
+        for u, contribution in enumerate(contributions):
+            original = block.iloc[u]
+            output.append(dict(
+                snapshot=snapshot["index"]+1, set=snapshot["set"],
+                scenario=snapshot["scenario"], scenario_order=snapshot["scenario_order"],
+                source_row_in_snapshot=u+1,
+                instance_id=original.get("instance_id", ""),
+                method=method, user=int(contribution["user"]),
+                is_candidate_pool=bool(contribution["is_candidate_pool"]),
+                served=bool(contribution["served"]),
+                rf_chain=(next((entry["rf_chain"] for entry in results[method]["table"]
+                                if entry["user"] == u), None)),
+                assigned_beam=contribution["beam"],
+                gain_linear=contribution["gain_linear"],
+                interference_linear=contribution["interference_linear"],
+                fairness=contribution["fairness"],
+            ))
+    return output
 
 def get_experiment_parameters(args):
     """Ask for missing values, or use defaults in non-interactive / --yes mode."""
@@ -361,10 +395,12 @@ def main():
                    f"QUBO coefficients: gain={LAMBDA_G}, interference={LAMBDA_I}, "
                    f"fairness={LAMBDA_F}, user={LAMBDA_U}, beam={LAMBDA_B}, RF={LAMBDA_R}\n"
                    f"fairness plot is unweighted\n"
+                   f"scenario graph = sum of selected-user contributions / all original source rows "
+                   f"(20 for two complete sets), NOT per-served-user mean\n"
                    f"optimiser: PennyLane, depth={base.P_DEPTH}, restarts={base.N_RESTARTS}\n"
                    f"measurement shots: {base.SHOTS}\n"
                    f"candidate shortlist matching feasibility repair: enabled\n")
-    rows, diagnostics = [], []
+    rows, per_user_rows, diagnostics = [], [], []
     for snap in snaps:
         i = snap["index"]
         print(f"\nSnapshot {i+1}/{len(snaps)}: {snap['set']} / {snap['scenario']}")
@@ -385,16 +421,20 @@ def main():
                              rf_chains=args.rf, qubits=args.users*args.beams,
                              method=method, gain_linear=r["gain_linear"],
                              interference_linear=r["interference_linear"], fairness=r["fairness"]))
+        per_user_rows.extend(make_per_user_records(snap, results, base.METHODS))
         if not extra["penalties_sufficient"]:
             print("   Warning: fixed QUBO constraint penalties do NOT make the unrestricted "
                   "weight-R ground state feasible for this snapshot; feasibility is enforced "
                   "during selection/ILP, not by changing the specified weights.")
+    per_user_csv = output / PER_USER_CSV
+    pd.DataFrame(per_user_rows).to_csv(per_user_csv, index=False)
     individual = output / RESULTS_CSV
     pd.DataFrame(rows).to_csv(individual, index=False)
     meanfile = output / MEANS_CSV
     means = aggregate_scenario_means(individual, meanfile)
     pd.DataFrame(diagnostics).to_csv(output / "qaoa_diagnostics.csv", index=False)
-    print(f"\nSaved {len(rows)} snapshot x method records: {individual}")
+    print(f"\nSaved {len(per_user_rows)} source-user x method records: {per_user_csv}")
+    print(f"Saved {len(rows)} snapshot x method records: {individual}")
     print(f"Saved {len(means)} scenario x method mean records: {meanfile}")
     if not args.no_plot:
         paths, _ = plotter.plot_from_csv(meanfile, out_dir=output)

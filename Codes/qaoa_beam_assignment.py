@@ -304,8 +304,30 @@ def evaluate(assign, H_users, beam_dict, G, users, cand):
                              in itertools.combinations(selected, 2)))
     fairness = float(sum(0.01 * (G[u, b] - mean_candidate_gain) ** 2
                          for u, b in selected))
+    # Per-source-user contributions; rows not assigned an RF chain contribute zero.
+    # Interference received by user u is sum of the powers from OTHER selected beams.
+    # Summing over selected users exactly recovers the symmetric pairwise proxy.
+    contributions = []
+    chosen_beams = dict(selected)
+    candidate_users = set(map(int, users))
+    for u in range(G.shape[0]):
+        beam = chosen_beams.get(u)
+        served = beam is not None
+        g_u = float(G[u, beam]) if served else 0.0
+        i_u = (float(sum(G[u, other_beam] for other_user, other_beam in selected
+                         if other_user != u)) if served else 0.0)
+        f_u = (float(0.01 * (g_u - mean_candidate_gain)**2) if served else 0.0)
+        contributions.append(dict(user=int(u), is_candidate_pool=u in candidate_users,
+                                  served=served, beam=int(beam) if served else None,
+                                  gain_linear=g_u, interference_linear=i_u, fairness=f_u))
+    for key, expected in (("gain_linear", gain), ("interference_linear", interference),
+                          ("fairness", fairness)):
+        if not np.isclose(sum(v[key] for v in contributions), expected,
+                          rtol=1e-10, atol=1e-8):
+            raise AssertionError(f"Per-user {key} does not reconcile with total {expected}")
     return dict(table=table, F_RF=RF, gain_linear=gain,
-                interference_linear=interference, fairness=fairness)
+                interference_linear=interference, fairness=fairness,
+                user_contributions=contributions)
 
 
 def run_seed(seed):
