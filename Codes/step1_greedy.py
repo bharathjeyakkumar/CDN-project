@@ -1,5 +1,4 @@
 import numpy as np
-from step0_gain_matrix import build_gain_matrix
 
 
 def greedy_assignment(
@@ -100,6 +99,7 @@ def greedy_assignment(
 
 
 if __name__ == "__main__":
+    from step0_gain_matrix import build_gain_matrix
 
     G, beam_dict, H_users = build_gain_matrix(
         n_antennas=16,

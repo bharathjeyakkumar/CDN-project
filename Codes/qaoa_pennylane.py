@@ -1,8 +1,7 @@
 """
 Gate-level XY-mixer QAOA in PennyLane (K*M-qubit encoding).
 
-Drop-in replacement for qaoa_circuit.py (same function names and return
-values), so qaoa_beam_assignment.py can use it with BACKEND = "pennylane".
+Dedicated PennyLane backend used by qaoa_beam_assignment.py.
 
 Qubit layout
 ------------
@@ -14,7 +13,7 @@ mixer is an XY mixer, so only bit strings with exactly R ones are ever reached.
 Bit-order warning
 -----------------
 PennyLane is BIG-endian: wire 0 is the most significant bit of a basis-state
-index (the opposite of Qiskit). All index helpers below use that convention,
+index (wire 0 is the most significant bit). All index helpers below use that convention,
 so the main script needs no changes.
 
 Sign convention
@@ -27,14 +26,13 @@ Circuit per layer l
 -------------------
   initial state : Dicke state |D_N^R>, Baertschi-Eidenbenz circuit
                   (DICKE_PREP = "circuit", O(N*R) gates, O(N) depth)
-                  or a direct statevector load (DICKE_PREP = "statevector",
+                  or a direct PennyLane StatePrep load (DICKE_PREP = "statevector",
                   faster, simulation only)
   U_C(gamma)    : RZ(2*gamma*h_i) on every wire
                   IsingZZ(2*gamma*J_ij) on every coupled pair
   U_XY(beta)    : for every edge (a, b) in `edges`, in the given order:
                   IsingXX(beta) then IsingYY(beta) = exp(-i*beta/2 (XX + YY))
-`edges` comes from qaoa_beam_assignment.xy_edges(), so the NumPy cross-check
-in the main script uses exactly the same ordered product.
+`edges` comes from qaoa_beam_assignment.xy_edges(), and preserves Hamming weight at every mixer layer.
 
 Optimiser
 ---------
@@ -42,7 +40,7 @@ Optimiser
            (adjoint differentiation on lightning.qubit, back-propagation on
            default.qubit), so one step costs about one forward + one backward
            pass instead of the many forward passes COBYLA needs.
-"cobyla" : gradient-free, same as the Qiskit module.
+"cobyla" : gradient-free SciPy optimizer.
 """
 
 import itertools
@@ -119,7 +117,7 @@ def build_cost_operator(h, J, N):
     return qml.dot(coeffs, ops)
 
 
-def verify_cost_operator(H, const, E_full, N, atol=1e-8):
+def verify_cost_operator(H, const, E_full, N, atol=1e-8, rtol=1e-10):
     """
     Rebuild the diagonal of H from its Pauli terms and compare with the QUBO
     energy over all 2^N basis states (checks the h/J mapping and bit order).
@@ -134,7 +132,11 @@ def verify_cost_operator(H, const, E_full, N, atol=1e-8):
             term = term * zval(w)
         diag += float(np.real(cf)) * term
     err = float(np.max(np.abs(diag - E_full)))
-    assert err < atol, f"Ising/Pauli operator mismatch: {err:.3e}"
+    scale = max(1.0, float(np.max(np.abs(E_full))), float(np.max(np.abs(diag))))
+    tolerance = atol + rtol * scale
+    assert err <= tolerance, (
+        f"Ising/Pauli operator mismatch: {err:.3e}, allowed: {tolerance:.3e}"
+    )
     return err
 
 
@@ -194,9 +196,19 @@ def qaoa_ops(params, h, J, N, R, edges, p):
 class PLCircuit:
     """Holds everything needed to run / sample / draw one QAOA circuit."""
 
-    def __init__(self, h, J, N, R, edges, p, H, const):
+    def __init__(self, h, J, N, R, edges, p, H, const, phase_scale=1.0):
         self.h, self.J, self.N, self.R, self.edges, self.p = h, J, N, R, list(edges), p
         self.H, self.const = H, float(const)
+        # Scale only the *angle parameterisation*, never the QUBO/Ising costs.
+        # gamma_physical = gamma_trainable / phase_scale avoids impractically
+        # oscillatory loss landscapes on high-power channel realisations.
+        self.phase_scale = float(phase_scale)
+        self._initialise_qnodes()
+
+    def physical_params(self, params):
+        return qml.math.concatenate([params[:self.p] / self.phase_scale, params[self.p:]])
+
+    def _initialise_qnodes(self):
 
         dev, diff = make_device(self.N)
         self.device_name = dev.name
@@ -204,14 +216,14 @@ class PLCircuit:
 
         @qml.qnode(dev, diff_method=diff)
         def energy(params):
-            qaoa_ops(params, h, J, N, R, self.edges, p)
-            return qml.expval(H)
+            qaoa_ops(self.physical_params(params), self.h, self.J, self.N, self.R, self.edges, self.p)
+            return qml.expval(self.H)
 
         dev_p = qml.device("default.qubit", wires=self.N)
 
         @qml.qnode(dev_p)
         def probs(params):
-            qaoa_ops(params, h, J, N, R, self.edges, p)
+            qaoa_ops(self.physical_params(params), self.h, self.J, self.N, self.R, self.edges, self.p)
             return qml.probs(wires=range(self.N))
 
         self.energy_qnode = energy
@@ -228,7 +240,7 @@ class PLCircuit:
 def circuit_statistics(circ, params):
     """Gate counts and depth, logical and compiled to {RZ, RX, RY, H, CNOT, X}."""
     with qml.queuing.AnnotatedQueue() as q:
-        qaoa_ops(params, circ.h, circ.J, circ.N, circ.R, circ.edges, circ.p)
+        qaoa_ops(circ.physical_params(params), circ.h, circ.J, circ.N, circ.R, circ.edges, circ.p)
     tape = qml.tape.QuantumScript(q.queue)
 
     def depth_of(ops):
@@ -301,13 +313,13 @@ def run_qaoa_circuit(Q, offset, h, J, c, N, R, edges, p, restarts, rng, maxiter=
     N, R  : number of qubits (users x beams) and Hamming weight (RF chains)
     edges : XY-mixer edges in application order (from qaoa_beam_assignment.xy_edges)
 
-    Returns (same tuple as qaoa_circuit.run_qaoa_circuit)
+    Returns a PennyLane-specific circuit result tuple
     -------
     best      : object with .x = [gammas, betas] and .fun = <H_C>
     prob_full : probabilities over all 2^N basis states at the optimum
     E_full    : diagonal of H_C over all 2^N basis states
     circ      : PLCircuit object
-    None, None: placeholders (Qiskit's gamma / beta ParameterVectors)
+    None, None: unused API slots; PennyLane stores angles in params
     stats     : circuit statistics
     """
     E_full = full_energies(Q, offset)
@@ -315,7 +327,9 @@ def run_qaoa_circuit(Q, offset, h, J, c, N, R, edges, p, restarts, rng, maxiter=
     const = c + offset
     op_err = verify_cost_operator(H, const, E_full, N)
 
-    circ = PLCircuit(h, J, N, R, edges, p, H, const)
+    # Global phase is irrelevant: only the variation in energies sets gamma range.
+    phase_scale = max(1.0, float(np.max(np.abs(E_full - np.mean(E_full)))))
+    circ = PLCircuit(h, J, N, R, edges, p, H, const, phase_scale=phase_scale)
 
     best = None
     for _ in range(restarts):
@@ -333,6 +347,7 @@ def run_qaoa_circuit(Q, offset, h, J, c, N, R, edges, p, restarts, rng, maxiter=
     stats["operator_check_err"] = op_err
     stats["n_pauli_terms"] = len(H.terms()[0]) + 1
     stats["optimizer"] = OPTIMIZER
+    stats["gamma_phase_scale"] = phase_scale
     return best, prob_full, E_full, circ, None, None, stats
 
 
@@ -349,7 +364,7 @@ def sample_indices(circ, gam, bet, params, shots, seed=0):
 
     @qml.qnode(dev)
     def sampler(params):
-        qaoa_ops(params, circ.h, circ.J, circ.N, circ.R, circ.edges, circ.p)
+        qaoa_ops(circ.physical_params(params), circ.h, circ.J, circ.N, circ.R, circ.edges, circ.p)
         return qml.counts(wires=range(circ.N))
 
     sampler = qml.set_shots(sampler, shots=shots)

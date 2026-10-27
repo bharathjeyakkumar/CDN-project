@@ -1,613 +1,125 @@
+"""Exact weighted beam-assignment QUBO with symmetric x.T @ Q @ x storage.
+
+Each decision x[k,s] selects the *s*-th candidate beam for user k.  If user
+candidate sets differ, ``candidate_beams[k,s]`` contains the global codebook
+beam ID and ``cross_gains[k,b]`` contains |H_k F_b|**2.  No scaling, gain
+normalisation, logarithms, or objective shifts are applied.
+
+The RF-cardinality penalty is included, with its constant lambda_R*R**2
+OMITTED, exactly as in the supplied reference formulation. Consequently a
+feasible weight-R solution has energy physical_objective - lambda_R*R**2.
+"""
+
+from itertools import combinations
 import numpy as np
 
+LAMBDA_G = 1.0
+LAMBDA_I = 0.5
+LAMBDA_F = 0.2
+LAMBDA_U = 6.0
+LAMBDA_B = 6.0
+LAMBDA_R = 6.0
 
-# ============================================================
-# BUILD QUBO MATRIX
-# ============================================================
+
+def fairness_matrix(candidate_gains):
+    """Unweighted gain-deviation fairness proxy, computed over candidate gains."""
+    gains = np.asarray(candidate_gains, dtype=float)
+    if gains.ndim != 2 or not np.all(np.isfinite(gains)):
+        raise ValueError("candidate_gains must be a finite 2D power-gain matrix")
+    return 0.01 * (gains - np.mean(gains)) ** 2
+
 
 def build_qubo_matrix(
-    G,
-    n_rf_chains,
-    user_penalty=None,
-    beam_penalty=None,
-    chain_penalty=None
+    candidate_gains, n_rf, *, candidate_beams=None, cross_gains=None,
+    lam_G=LAMBDA_G, lam_I=LAMBDA_I, lam_F=LAMBDA_F,
+    lam_U=LAMBDA_U, lam_B=LAMBDA_B, lam_R=LAMBDA_R,
 ):
+    """Return (symmetric_Q, 0.0), matching the original QUBO coefficients.
+
+    ``candidate_gains``: shape (K, M), |H_k F_{candidate[k,s]}|**2.
+    ``candidate_beams``: shape (K, M), global beam ID per variable; defaults
+        to common IDs 0..M-1, matching the standalone reference example.
+    ``cross_gains``: shape (K, n_global_beams), needed when candidate beam IDs
+        differ between users to calculate actual cross-user leakage.
     """
-    Build QUBO matrix for user-beam assignment.
+    g = np.asarray(candidate_gains, dtype=float)
+    if g.ndim != 2 or g.size == 0 or np.any(~np.isfinite(g)) or np.any(g < 0):
+        raise ValueError("candidate_gains must be a nonnegative, finite K x M matrix")
+    K, M = g.shape
+    if not 0 <= n_rf <= K:
+        raise ValueError("n_rf must be between zero and the number of users")
+    bids = (np.tile(np.arange(M), (K, 1)) if candidate_beams is None
+            else np.asarray(candidate_beams, dtype=int))
+    if bids.shape != g.shape or np.any(bids < 0):
+        raise ValueError("candidate_beams must contain nonnegative IDs with shape (K,M)")
+    full = g if cross_gains is None else np.asarray(cross_gains, dtype=float)
+    if (full.ndim != 2 or full.shape[0] != K or np.max(bids) >= full.shape[1]
+            or np.any(~np.isfinite(full)) or np.any(full < 0)):
+        raise ValueError("cross_gains must provide nonnegative powers for every candidate beam ID")
+    # Check that the two views of signal power are consistent.
+    if not np.allclose(np.take_along_axis(full, bids, axis=1), g, rtol=1e-8, atol=1e-10):
+        raise ValueError("candidate_gains do not match cross_gains at candidate_beams")
+    if any(len(set(row)) != M for row in bids):
+        raise ValueError("Repeated candidate beam ID within one user")
 
-    Decision variable:
+    N = K * M
+    Q = np.zeros((N, N), dtype=float)
 
-        x[k,m] = 1
-            User k is assigned Beam m
+    def pair(i, j, coeff):
+        if i == j:
+            Q[i, i] += coeff
+        else:
+            Q[i, j] += coeff / 2.0
+            Q[j, i] += coeff / 2.0
 
-        x[k,m] = 0
-            Otherwise
+    # (4) Gain and (6) fairness: linear terms.
+    Q[np.diag_indices(N)] += (-lam_G * g + lam_F * fairness_matrix(g)).reshape(-1)
 
-    Objective:
+    # (5) All different-user pairs, regardless of the local/global beam order.
+    for k, j in combinations(range(K), 2):
+        for s in range(M):
+            for t in range(M):
+                leak = full[k, bids[j, t]] + full[j, bids[k, s]]
+                pair(k * M + s, j * M + t, lam_I * leak)
+                if bids[k, s] == bids[j, t]:
+                    pair(k * M + s, j * M + t, lam_B)
 
-        Maximize:
-            sum G[k,m] * x[k,m]
-
-        Since QUBO is minimized:
-
-            Minimize:
-                -sum G[k,m] * x[k,m]
-
-    Constraints:
-
-        1. One user can receive at most one beam.
-        2. One beam can be assigned to at most one user.
-        3. Exactly n_rf_chains assignments must be selected.
-
-    Parameters
-    ----------
-    G : np.ndarray
-        Gain matrix of shape (K, M).
-
-    n_rf_chains : int
-        Number of RF chains / assignments.
-
-    user_penalty : float
-        Penalty for assigning multiple beams to the same user.
-
-    beam_penalty : float
-        Penalty for assigning the same beam to multiple users.
-
-    chain_penalty : float
-        Penalty for selecting a number of assignments different
-        from n_rf_chains.
-
-    Returns
-    -------
-    Q : np.ndarray
-        Symmetric QUBO matrix of shape (K*M, K*M).
-
-    variable_map : dict
-        Maps variable index -> (user, beam).
-
-    reverse_map : dict
-        Maps (user, beam) -> variable index.
-    """
-
-    # --------------------------------------------------------
-    # Convert G to numpy array
-    # --------------------------------------------------------
-
-    G = np.asarray(G, dtype=float)
-
-    if G.ndim != 2:
-        raise ValueError("G must be a 2-dimensional matrix.")
-
-    K, M = G.shape
-
-    n_variables = K * M
-
-    # --------------------------------------------------------
-    # Validate number of RF chains
-    # --------------------------------------------------------
-
-    if n_rf_chains <= 0:
-        raise ValueError("n_rf_chains must be greater than 0.")
-
-    if n_rf_chains > min(K, M):
-        raise ValueError(
-            "n_rf_chains cannot be greater than "
-            "the number of users or beams."
-        )
-
-    # --------------------------------------------------------
-    # Penalty values
-    # --------------------------------------------------------
-
-    max_gain = np.max(G)
-
-    if max_gain <= 0:
-        max_gain = 1.0
-
-    if user_penalty is None:
-        user_penalty = 2.0 * max_gain
-
-    if beam_penalty is None:
-        beam_penalty = 2.0 * max_gain
-
-    if chain_penalty is None:
-        chain_penalty = 2.0 * max_gain
-
-    # --------------------------------------------------------
-    # Create QUBO matrix
-    #
-    # Energy:
-    #
-    #       E = x^T Q x
-    #
-    # Q is symmetric.
-    #
-    # Therefore, if a quadratic term has coefficient C:
-    #
-    #       C * xi * xj
-    #
-    # we put:
-    #
-    #       Q[i,j] += C/2
-    #       Q[j,i] += C/2
-    #
-    # because x^T Q x counts both.
-    # --------------------------------------------------------
-
-    Q = np.zeros(
-        (n_variables, n_variables),
-        dtype=float
-    )
-
-    # --------------------------------------------------------
-    # Variable mapping
-    # --------------------------------------------------------
-
-    variable_map = {}
-    reverse_map = {}
-
-    index = 0
-
+    # (7) At most one candidate per user.
     for k in range(K):
+        for s, t in combinations(range(M), 2):
+            pair(k * M + s, k * M + t, lam_U)
+
+    # (9) lambda_R * [(sum x)^2 - 2 R sum x], with constant omitted.
+    Q[np.diag_indices(N)] += lam_R * (1 - 2 * n_rf)
+    for i, j in combinations(range(N), 2):
+        pair(i, j, 2 * lam_R)
+    return Q, 0.0
+
+
+def physical_components(selected_local, candidate_gains, candidate_beams=None,
+                        cross_gains=None):
+    """Return unweighted (gain, interference, fairness) for selected (k,s) pairs."""
+    g = np.asarray(candidate_gains, dtype=float)
+    K, M = g.shape
+    bids = np.tile(np.arange(M), (K, 1)) if candidate_beams is None else np.asarray(candidate_beams)
+    full = g if cross_gains is None else np.asarray(cross_gains, dtype=float)
+    selected = [(int(k), int(s)) for k, s in selected_local]
+    gain = sum(float(g[k, s]) for k, s in selected)
+    fairness = sum(float(fairness_matrix(g)[k, s]) for k, s in selected)
+    interference = sum(float(full[k, bids[j, t]] + full[j, bids[k, s]])
+                       for (k, s), (j, t) in combinations(selected, 2))
+    return dict(gain_linear=gain, interference_linear=interference, fairness=fairness)
 
-        for m in range(M):
-
-            variable_map[index] = (k, m)
-
-            reverse_map[(k, m)] = index
-
-            index += 1
-
-    # ========================================================
-    # 1. OBJECTIVE FUNCTION
-    # ========================================================
-
-    # Maximize:
-    #
-    #       sum G[k,m] x[k,m]
-    #
-    # Convert to minimization:
-    #
-    #       -sum G[k,m] x[k,m]
-    #
-    # Therefore diagonal:
-    #
-    #       Q[i,i] += -G[k,m]
-    # ========================================================
-
-    for k in range(K):
-
-        for m in range(M):
-
-            i = reverse_map[(k, m)]
-
-            Q[i, i] += -G[k, m]
-
-    # ========================================================
-    # 2. USER CONSTRAINT
-    # ========================================================
-
-    # At most one beam per user:
-    #
-    #       sum_m x[k,m] <= 1
-    #
-    # Penalty:
-    #
-    #       Pu * xi * xj
-    #
-    # for every pair of beams belonging to the same user.
-    #
-    # Because Q is symmetric:
-    #
-    #       Q[i,j] += Pu/2
-    #       Q[j,i] += Pu/2
-    # ========================================================
-
-    for k in range(K):
-
-        for m1 in range(M):
-
-            for m2 in range(m1 + 1, M):
-
-                i = reverse_map[(k, m1)]
-                j = reverse_map[(k, m2)]
-
-                Q[i, j] += user_penalty / 2.0
-                Q[j, i] += user_penalty / 2.0
-
-    # ========================================================
-    # 3. BEAM CONSTRAINT
-    # ========================================================
-
-    # At most one user per beam:
-    #
-    #       sum_k x[k,m] <= 1
-    #
-    # Penalty:
-    #
-    #       Pb * xi * xj
-    #
-    # for every pair of users using the same beam.
-    # ========================================================
-
-    for m in range(M):
-
-        for k1 in range(K):
-
-            for k2 in range(k1 + 1, K):
-
-                i = reverse_map[(k1, m)]
-                j = reverse_map[(k2, m)]
-
-                Q[i, j] += beam_penalty / 2.0
-                Q[j, i] += beam_penalty / 2.0
-
-    # ========================================================
-    # 4. EXACTLY N_RF ASSIGNMENTS
-    # ========================================================
-
-    # Constraint:
-    #
-    #       sum_i xi = N_RF
-    #
-    # Penalty:
-    #
-    #       Pc (sum_i xi - N_RF)^2
-    #
-    # Expand:
-    #
-    #       Pc [
-    #           sum_i xi
-    #           + 2 sum_(i<j) xi*xj
-    #           - 2*N_RF*sum_i xi
-    #           + N_RF^2
-    #       ]
-    #
-    # Since:
-    #
-    #       xi^2 = xi
-    #
-    # Linear coefficient:
-    #
-    #       Pc(1 - 2*N_RF)
-    #
-    # Quadratic coefficient:
-    #
-    #       2*Pc
-    #
-    # Since Q is symmetric, each side receives:
-    #
-    #       (2*Pc)/2 = Pc
-    #
-    # ========================================================
-
-    # Linear terms
-    for i in range(n_variables):
-
-        Q[i, i] += (
-            chain_penalty
-            * (1 - 2 * n_rf_chains)
-        )
-
-    # Quadratic terms
-    for i in range(n_variables):
-
-        for j in range(i + 1, n_variables):
-
-            Q[i, j] += chain_penalty
-            Q[j, i] += chain_penalty
-
-    # --------------------------------------------------------
-    # Return QUBO
-    # --------------------------------------------------------
-
-    return Q, variable_map, reverse_map
-
-
-# ============================================================
-# CONVERT BITSTRING TO USER-BEAM ASSIGNMENT
-# ============================================================
-
-def bitstring_to_assignment(
-    bitstring,
-    variable_map
-):
-    """
-    Convert a binary solution into:
-
-        [(user, beam), ...]
-
-    Example:
-
-        [1,0,0,0,1,0]
-
-    becomes:
-
-        [(0,0), (1,1)]
-    """
-
-    assignment = []
-
-    for i, bit in enumerate(bitstring):
-
-        if int(bit) == 1:
-
-            user, beam = variable_map[i]
-
-            assignment.append(
-                (user, beam)
-            )
-
-    return assignment
-
-
-# ============================================================
-# CALCULATE QUBO ENERGY
-# ============================================================
-
-def calculate_qubo_energy(
-    Q,
-    bitstring
-):
-    """
-    Calculate:
-
-        E = x^T Q x
-    """
-
-    x = np.asarray(
-        bitstring,
-        dtype=float
-    )
-
-    if len(x) != Q.shape[0]:
-        raise ValueError(
-            "Bitstring length must match QUBO dimension."
-        )
-
-    return float(
-        x @ Q @ x
-    )
-
-
-# ============================================================
-# CHECK ASSIGNMENT VALIDITY
-# ============================================================
-
-def check_assignment(
-    assignment,
-    n_users,
-    n_beams,
-    n_rf_chains
-):
-    """
-    Check whether an assignment satisfies:
-
-        1. One beam per user
-        2. One user per beam
-        3. Exactly n_rf_chains assignments
-    """
-
-    users = [user for user, beam in assignment]
-
-    beams = [beam for user, beam in assignment]
-
-    # Number of assignments
-    correct_count = (
-        len(assignment) == n_rf_chains
-    )
-
-    # No duplicate users
-    unique_users = (
-        len(users) == len(set(users))
-    )
-
-    # No duplicate beams
-    unique_beams = (
-        len(beams) == len(set(beams))
-    )
-
-    valid = (
-        correct_count
-        and unique_users
-        and unique_beams
-    )
-
-    return valid
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 if __name__ == "__main__":
-
-    # --------------------------------------------------------
-    # PROJECT PARAMETERS
-    # --------------------------------------------------------
-
-    K = 20              # Number of users
-    M = 16              # Number of candidate beams
-    N_RF = 8            # Number of RF chains
-
-    # --------------------------------------------------------
-    # Generate example gain matrix
-    #
-    # IMPORTANT:
-    # This is only for testing.
-    #
-    # In your actual project, replace this with your
-    # real gain matrix generated from the channel model.
-    # --------------------------------------------------------
-
-    np.random.seed(42)
-
-    G = np.random.rand(K, M)
-
-    # --------------------------------------------------------
-    # Print gain matrix
-    # --------------------------------------------------------
-
-    np.set_printoptions(
-        precision=3,
-        suppress=True,
-        linewidth=200
-    )
-
-    print("=" * 70)
-    print("GAIN MATRIX")
-    print("=" * 70)
-
-    print("Shape:", G.shape)
-
-    print(G)
-
-    # --------------------------------------------------------
-    # Build QUBO
-    # --------------------------------------------------------
-
-    Q, variable_map, reverse_map = build_qubo_matrix(
-        G,
-        n_rf_chains=N_RF
-    )
-
-    # --------------------------------------------------------
-    # Print QUBO information
-    # --------------------------------------------------------
-
-    print("\n" + "=" * 70)
-    print("QUBO INFORMATION")
-    print("=" * 70)
-
-    print("Number of users:", K)
-    print("Number of beams:", M)
-    print("Number of RF chains:", N_RF)
-
-    print(
-        "Number of binary variables:",
-        K * M
-    )
-
-    print(
-        "QUBO matrix shape:",
-        Q.shape
-    )
-
-    # --------------------------------------------------------
-    # Print complete QUBO matrix
-    # --------------------------------------------------------
-
-    print("\n" + "=" * 70)
-    print("COMPLETE QUBO MATRIX")
-    print("=" * 70)
-
-    print(Q)
-
-    # --------------------------------------------------------
-    # Save QUBO matrix
-    # --------------------------------------------------------
-
-    np.savetxt(
-        "qubo_matrix.csv",
-        Q,
-        delimiter=",",
-        fmt="%.6f"
-    )
-
-    print("\nQUBO matrix saved as:")
-    print("qubo_matrix.csv")
-
-    # --------------------------------------------------------
-    # Variable mapping
-    # --------------------------------------------------------
-
-    print("\n" + "=" * 70)
-    print("VARIABLE MAPPING")
-    print("=" * 70)
-
-    print("\nFirst 20 variables:")
-
-    for i in range(min(20, len(variable_map))):
-
-        user, beam = variable_map[i]
-
-        print(
-            f"x[{i}] -> "
-            f"User {user}, Beam {beam}"
-        )
-
-    # --------------------------------------------------------
-    # Example bitstring
-    # --------------------------------------------------------
-
-    example_bitstring = np.zeros(
-        K * M,
-        dtype=int
-    )
-
-    # Select 8 valid user-beam pairs
-    #
-    # User 0 -> Beam 0
-    # User 1 -> Beam 1
-    # ...
-    # User 7 -> Beam 7
-
-    for k in range(N_RF):
-
-        index = reverse_map[(k, k)]
-
-        example_bitstring[index] = 1
-
-    # --------------------------------------------------------
-    # Convert bitstring to assignment
-    # --------------------------------------------------------
-
-    assignment = bitstring_to_assignment(
-        example_bitstring,
-        variable_map
-    )
-
-    print("\n" + "=" * 70)
-    print("EXAMPLE ASSIGNMENT")
-    print("=" * 70)
-
-    print("Bitstring:")
-    print(example_bitstring)
-
-    print("\nAssignment:")
-
-    for user, beam in assignment:
-
-        print(
-            f"User {user} -> Beam {beam}"
-        )
-
-    # --------------------------------------------------------
-    # Calculate energy
-    # --------------------------------------------------------
-
-    energy = calculate_qubo_energy(
-        Q,
-        example_bitstring
-    )
-
-    print("\nQUBO Energy:")
-
-    print(energy)
-
-    # --------------------------------------------------------
-    # Check validity
-    # --------------------------------------------------------
-
-    valid = check_assignment(
-        assignment,
-        K,
-        M,
-        N_RF
-    )
-
-    print("\nAssignment valid:", valid)
-
-    print("\n" + "=" * 70)
-    print("QUBO GENERATION COMPLETED")
-    print("=" * 70)
+    rng = np.random.default_rng(42)
+    K, Nt, M, n_rf = 3, 8, 3, 2
+    H = (rng.standard_normal((K, Nt)) + 1j*rng.standard_normal((K, Nt))) / np.sqrt(2)
+    angles = np.linspace(-np.pi/3, np.pi/3, M)
+    F = np.exp(1j*np.pi*np.outer(np.arange(Nt), np.sin(angles))) / np.sqrt(Nt)
+    G2 = abs(H @ F)**2
+    Q, _ = build_qubo_matrix(G2, n_rf)
+    print("Power gain matrix G2:\n", np.round(G2, 4))
+    print("Unweighted fairness matrix:\n", np.round(fairness_matrix(G2), 6))
+    print("Exact symmetric QUBO matrix:\n", np.round(Q, 4))
+    print("QUBO objective: minimize x.T @ Q @ x (RF constant omitted)")
