@@ -204,3 +204,29 @@ python qaoa_beam_assignment_datasets.py --users 4 --beams 3 --rf 2 --yes --chann
 ```
 
 Existing 1024-shot PennyLane setting, exact QUBO, interactive parameters, channel-model integration, and candidate-feasibility repair remain unchanged. The full quantum run was not executed in the packaging environment.
+
+
+## Added: weighted multi-objective score (all four methods)
+
+No optimization, constraint, selection, or plotting logic is changed by this addition.
+For each **feasible assignment**, the reported physical objective is:
+
+```text
+objective_score = -1.0 * gain_linear + 0.5 * interference_linear + 0.2 * fairness
+```
+
+Lower values are better. This score is computed identically for Greedy, OMP,
+QAOA-XY, and ILP from their evaluated assignments. It appears in each
+method/snapshot row of `qaoa_dataset_results.csv` and is printed in the console.
+The scenario-summary file `qaoa_scenario_means.csv` also contains
+`objective_score`, aggregated according to the **existing** per-source-row
+formula (sum of snapshot scores divided by source rows, normally 20).
+The project still writes its original per-user metrics and three graphs.
+
+The score excludes constraint penalties and the omitted RF cardinality constant.
+For feasible QAOA/ILP assignments the raw QUBO energy equals
+`objective_score - LAMBDA_R * (RF_chains**2)`. The score is valid as a common
+**evaluation** of original Greedy and OMP, even when they choose global beams
+outside the shorter QAOA candidate sets; do not interpret that as an equal
+search-space comparison. The score is on the raw, unnormalized metric scale;
+changing the candidate mean, model, or weights changes its interpretation.

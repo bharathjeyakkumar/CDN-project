@@ -325,8 +325,13 @@ def evaluate(assign, H_users, beam_dict, G, users, cand):
         if not np.isclose(sum(v[key] for v in contributions), expected,
                           rtol=1e-10, atol=1e-8):
             raise AssertionError(f"Per-user {key} does not reconcile with total {expected}")
+    # The same feasible physical score is reported for every method.
+    # RF-cardinality contributes only the omitted constant -lambda_R*R**2.
+    objective_score = float(-LAMBDA_G * gain + LAMBDA_I * interference
+                            + LAMBDA_F * fairness)
     return dict(table=table, F_RF=RF, gain_linear=gain,
                 interference_linear=interference, fairness=fairness,
+                objective_score=objective_score,
                 user_contributions=contributions)
 
 

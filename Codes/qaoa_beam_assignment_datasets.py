@@ -9,11 +9,13 @@ problem's multiuser nature without incorrectly treating individual users as
 independent RF-assignment runs.
 
 Files per run:
-- qaoa_dataset_results.csv: 20 snapshot x 4 method rows = 80 total records.
+- qaoa_dataset_results.csv: 20 snapshot x 4 method rows = 80 total records;
+  contains objective_score = -lambda_G*gain + lambda_I*interference + lambda_F*fairness.
 - qaoa_per_user_results.csv: 200 source rows x 4 methods = 800 rows for a full run.
   Unserved users contribute ZERO (no assigned beam, received interference or fairness).
 - qaoa_scenario_means.csv: 10 scenario x 4 method = 40 mean records; each
-  scenario mean is (Set 1 TOTAL + Set 2 TOTAL) / 20 source rows.
+  scenario mean is (Set 1 TOTAL + Set 2 TOTAL) / 20 source rows,
+  including the corresponding linear objective_score mean.
 - Exactly three plots by plotter.py: linear gain, linear interference, fairness.
 
 The supplied channels.py computes path loss, shadow fading and channel rays
@@ -271,7 +273,7 @@ def aggregate_scenario_means(snapshot_results, out_path=None):
     For a one-set run the denominator is 10 (actual source rows available).
     """
     df = pd.read_csv(snapshot_results) if isinstance(snapshot_results, (str, Path)) else snapshot_results.copy()
-    cols = ("gain_linear", "interference_linear", "fairness")
+    cols = ("gain_linear", "interference_linear", "fairness", "objective_score")
     required = {"scenario_order", "scenario", "method", "set", "source_rows", *cols}
     if required - set(df.columns):
         raise ValueError(f"Missing snapshot CSV columns: {sorted(required-set(df.columns))}")
@@ -413,14 +415,15 @@ def main():
             r = results[method]
             base.print_rf_table(method, r["table"])
             print(f"   gain={r['gain_linear']:.6g} | interference={r['interference_linear']:.6g} "
-                  f"| fairness={r['fairness']:.6g}")
+                  f"| fairness={r['fairness']:.6g} | objective={r['objective_score']:.6g}")
             rows.append(dict(snapshot=i+1, set=snap["set"], scenario=snap["scenario"],
                              scenario_order=snap["scenario_order"],
                              source_rows=snap["row_count"], model=snap["info"]["channel_model"],
                              N=snap["N"], users=args.users, beams=args.beams,
                              rf_chains=args.rf, qubits=args.users*args.beams,
                              method=method, gain_linear=r["gain_linear"],
-                             interference_linear=r["interference_linear"], fairness=r["fairness"]))
+                             interference_linear=r["interference_linear"], fairness=r["fairness"],
+                             objective_score=r["objective_score"]))
         per_user_rows.extend(make_per_user_records(snap, results, base.METHODS))
         if not extra["penalties_sufficient"]:
             print("   Warning: fixed QUBO constraint penalties do NOT make the unrestricted "

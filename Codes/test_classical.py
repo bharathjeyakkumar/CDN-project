@@ -70,6 +70,10 @@ def check_methods():
         metrics=base.evaluate(a,H,F,G,users,candidate)
         chosen=list(a)
         np.testing.assert_allclose(metrics["gain_linear"],sum(G[k,b] for k,b in chosen))
+        np.testing.assert_allclose(metrics["objective_score"],
+            -base.LAMBDA_G*metrics["gain_linear"]
+            +base.LAMBDA_I*metrics["interference_linear"]
+            +base.LAMBDA_F*metrics["fairness"])
         np.testing.assert_allclose(metrics["fairness"],sum(
             0.01*(G[k,b]-candidate_gain.mean())**2 for k,b in chosen))
     # Every source user has a row, and contributions add to snapshot totals.
@@ -101,7 +105,8 @@ def check_spreadsheet_and_plots():
                 rows.append(dict(snapshot=10*set_idx+i+1,set=f"Set {set_idx+1}",
                     scenario=scenario,scenario_order=i+1,source_rows=10,method=name,
                     gain_linear=10*set_idx+i, interference_linear=2*set_idx+i,
-                    fairness=3*set_idx+i))
+                    fairness=3*set_idx+i,
+                    objective_score=-(10*set_idx+i)+0.5*(2*set_idx+i)+0.2*(3*set_idx+i)))
     with tempfile.TemporaryDirectory() as temp:
         mean_path=Path(temp)/"means.csv"
         means=datasets.aggregate_scenario_means(pd.DataFrame(rows),mean_path)
@@ -109,6 +114,8 @@ def check_spreadsheet_and_plots():
         assert set(means["snapshot_count"])=={2}
         first=means[(means.scenario=="UMi-LOS")&(means.method=="OMP")].iloc[0]
         assert first["gain_linear"]==0.5 and first["interference_linear"]==0.1
+        np.testing.assert_allclose(first["objective_score"],
+            -first["gain_linear"]+0.5*first["interference_linear"]+0.2*first["fairness"])
         # Synthetic source row mapping: 10 users x 2 methods.
         fake = {method: {"user_contributions": [dict(user=u,
                     is_candidate_pool=(u < 4), served=(u < 2),
