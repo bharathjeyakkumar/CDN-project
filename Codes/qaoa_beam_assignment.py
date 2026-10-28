@@ -268,6 +268,62 @@ def measure_and_select(probs, energies, states, users, cand, rng, observed=None)
     raise RuntimeError("No feasible assignment in the weight-R subspace")
 
 
+def select_without_feasibility(probs, energies, states, users, cand, rng, observed=None):
+    """QAOA_FCN: minimum-QUBO-energy SAMPLE, without feasibility filtering.
+
+    Uses exactly the same PennyLane circuit and measurement outcomes as QAOA-XY.
+    Never substitutes the exact enumerated ground state for a sampled outcome.
+    """
+    if observed is not None:
+        sampled = np.unique(np.asarray(observed, dtype=int))
+    else:
+        sampled = np.unique(rng.choice(len(probs), size=SHOTS, p=probs))
+    if not len(sampled):
+        raise RuntimeError("No weight-R samples available for QAOA_FCN")
+    idx = int(sampled[np.argmin(energies[sampled])])
+    return decode(states[idx], users, cand), float(energies[idx])
+
+
+def evaluate_unchecked(assign, H_users, beam_dict, G, users, cand):
+    """Physical metrics for QAOA_FCN, including infeasible beam selections.
+
+    Same per-selection gain and fairness terms as QUBO; cross-user interference
+    only for DISTINCT users. Multiple beams assigned to one user accumulate in
+    that user's row, preserving one row per workbook source user. Reports raw
+    physical objective, NOT the constraint-penalized energy.
+    """
+    selected = [(int(u), int(b)) for u, b in assign]
+    mean_gain = float(np.mean(candidate_gain_matrix(G, users, cand)))
+    gains = [float(G[u, b]) for u, b in selected]
+    fairs = [float(.01 * (v - mean_gain) ** 2) for v in gains]
+    interference_by_selection = [float(sum(G[u, bb] for vv, bb in selected
+                                           if vv != u)) for u, b in selected]
+    gain = float(sum(gains))
+    interference = float(sum(interference_by_selection))
+    fairness = float(sum(fairs))
+    table, RF = assign_to_rf_chains(selected, G, beam_dict)
+    candidate_users = set(map(int, users))
+    contributions = []
+    for u in range(G.shape[0]):
+        positions = [i for i, (v, _) in enumerate(selected) if v == u]
+        beams = [selected[i][1] for i in positions]
+        contributions.append(dict(
+            user=int(u), is_candidate_pool=u in candidate_users,
+            served=bool(positions), beam="|".join(map(str, beams)) if beams else None,
+            gain_linear=float(sum(gains[i] for i in positions)),
+            interference_linear=float(sum(interference_by_selection[i] for i in positions)),
+            fairness=float(sum(fairs[i] for i in positions)),
+        ))
+    for key, expected in (("gain_linear", gain), ("interference_linear", interference),
+                          ("fairness", fairness)):
+        if not np.isclose(sum(v[key] for v in contributions), expected, rtol=1e-10, atol=1e-8):
+            raise AssertionError(f"FCN user {key} does not reconcile with total")
+    score = float(-LAMBDA_G * gain + LAMBDA_I * interference + LAMBDA_F * fairness)
+    return dict(table=table, F_RF=RF, gain_linear=gain,
+                interference_linear=interference, fairness=fairness,
+                objective_score=score, user_contributions=contributions)
+
+
 def assign_to_rf_chains(assign, G, beam_dict):
     ordered = sorted(assign, key=lambda ub: -G[ub[0], ub[1]])
     table = [dict(rf_chain=i, user=int(u), beam=int(b), gain=float(G[u, b]))
@@ -376,6 +432,9 @@ def run_seed(seed):
     qaoa_assign, measured = measure_and_select(probs, energies, states, users, cand, rng,
                                                observed=observed)
 
+    fcn_assign, fcn_qubo_energy = select_without_feasibility(
+        probs, energies, states, users, cand, rng, observed=observed)
+
     ilp_assign, ilp_objective, ilp_duration = ilp_assignment(G, users, cand, N_RF_SUB)
     if not np.isclose(ilp_objective, energies[opt_idx], atol=1e-5, rtol=1e-7):
         raise AssertionError(f"ILP energy {ilp_objective} != exact QUBO energy {energies[opt_idx]}")
@@ -404,6 +463,10 @@ def run_seed(seed):
         ):
             raise AssertionError(f"{name} selected a beam outside the user's candidates")
     results = {name: evaluate(a, H, F, G, users, cand) for name, a in assignments.items()}
+    results["QAOA_FCN"] = evaluate_unchecked(fcn_assign, H, F, G, users, cand)
+    for name, assignment in [*assignments.items(), ("QAOA_FCN", fcn_assign)]:
+        results[name]["feasibility_check"] = "Yes" if is_feasible(assignment, N_RF_SUB) else "No"
+    results["QAOA_FCN"]["qubo_energy"] = fcn_qubo_energy
     feasible_inds = np.flatnonzero(feasible)
     extra = dict(
         energy=float(circuit_result.fun), e_opt=float(energies[opt_idx]),

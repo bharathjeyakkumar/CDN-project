@@ -101,34 +101,40 @@ def check_spreadsheet_and_plots():
     rows=[]
     for set_idx in range(2):
         for i, scenario in enumerate(dict.fromkeys(df["scenario"])):
-            for name in datasets.base.METHODS:
+            for name in datasets.REPORT_METHODS:
                 rows.append(dict(snapshot=10*set_idx+i+1,set=f"Set {set_idx+1}",
                     scenario=scenario,scenario_order=i+1,source_rows=10,method=name,
                     gain_linear=10*set_idx+i, interference_linear=2*set_idx+i,
                     fairness=3*set_idx+i,
-                    objective_score=-(10*set_idx+i)+0.5*(2*set_idx+i)+0.2*(3*set_idx+i)))
+                    objective_score=-(10*set_idx+i)+0.5*(2*set_idx+i)+0.2*(3*set_idx+i),
+                    feasibility_check=("No" if name == "QAOA_FCN" and set_idx == 1 else "Yes")))
     with tempfile.TemporaryDirectory() as temp:
         mean_path=Path(temp)/"means.csv"
         means=datasets.aggregate_scenario_means(pd.DataFrame(rows),mean_path)
-        assert len(means)==40 and set(means["source_rows"])=={20}
+        assert len(means)==50 and set(means["source_rows"])=={20}
         assert set(means["snapshot_count"])=={2}
         first=means[(means.scenario=="UMi-LOS")&(means.method=="OMP")].iloc[0]
         assert first["gain_linear"]==0.5 and first["interference_linear"]==0.1
         np.testing.assert_allclose(first["objective_score"],
             -first["gain_linear"]+0.5*first["interference_linear"]+0.2*first["fairness"])
-        # Synthetic source row mapping: 10 users x 2 methods.
+        check_fcn=means[(means.scenario=="UMi-LOS") & (means.method=="QAOA_FCN")].iloc[0]
+        assert check_fcn["feasibility_check"] == "No"
+        assert check_fcn["feasible_snapshots"] == 1
+        assert check_fcn["feasibility_rate"] == 0.5
+        # Synthetic source row mapping: 10 users x 4 methods.
         fake = {method: {"user_contributions": [dict(user=u,
                     is_candidate_pool=(u < 4), served=(u < 2),
                     beam=(u+1 if u < 2 else None),
                     gain_linear=(u+1 if u < 2 else 0.),
                     interference_linear=(0.5 if u < 2 else 0.),
                     fairness=(0.1 if u < 2 else 0.)) for u in range(10)],
-                    "table": [dict(rf_chain=u, user=u) for u in range(2)]}
-                for method in datasets.base.METHODS}
+                    "table": [dict(rf_chain=u, user=u) for u in range(2)],
+                    "feasibility_check": "Yes"}
+                for method in datasets.REPORT_METHODS}
         snap = dict(index=0,set="Set 1",scenario="UMi-LOS",scenario_order=1,
                     rows=df.iloc[:10])
-        per_user=datasets.make_per_user_records(snap,fake,datasets.base.METHODS)
-        assert len(per_user)==40 and sum(r["served"] for r in per_user)==8
+        per_user=datasets.make_per_user_records(snap,fake,datasets.REPORT_METHODS)
+        assert len(per_user)==50 and sum(r["served"] for r in per_user)==10
         assert per_user[0]["gain_linear"]==1 and per_user[9]["gain_linear"]==0
         paths,_=plotter.plot_from_csv(mean_path,out_dir=temp)
         assert len(paths)==6 and all(p.exists() for p in paths)

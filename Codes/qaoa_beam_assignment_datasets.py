@@ -9,11 +9,11 @@ problem's multiuser nature without incorrectly treating individual users as
 independent RF-assignment runs.
 
 Files per run:
-- qaoa_dataset_results.csv: 20 snapshot x 4 method rows = 80 total records;
+- qaoa_dataset_results.csv: 20 snapshot x 5 method rows = 100 total records;
   contains objective_score = -lambda_G*gain + lambda_I*interference + lambda_F*fairness.
-- qaoa_per_user_results.csv: 200 source rows x 4 methods = 800 rows for a full run.
+- qaoa_per_user_results.csv: 200 source rows x 5 methods = 1000 rows for a full run.
   Unserved users contribute ZERO (no assigned beam, received interference or fairness).
-- qaoa_scenario_means.csv: 10 scenario x 4 method = 40 mean records; each
+- qaoa_scenario_means.csv: 10 scenario x 5 method = 50 mean records; each
   scenario mean is (Set 1 TOTAL + Set 2 TOTAL) / 20 source rows,
   including the corresponding linear objective_score mean.
 - Exactly three plots by plotter.py: linear gain, linear interference, fairness.
@@ -55,6 +55,7 @@ RESULTS_CSV = "qaoa_dataset_results.csv"
 MEANS_CSV = "qaoa_scenario_means.csv"
 PER_USER_CSV = "qaoa_per_user_results.csv"
 MAX_QUBITS = 20
+REPORT_METHODS = [*base.METHODS, "QAOA_FCN"]
 
 
 def retries_for(qubits):
@@ -288,6 +289,16 @@ def aggregate_scenario_means(snapshot_results, out_path=None):
                       sets_combined=" | ".join(dict.fromkeys(block["set"])))
         for metric in cols:
             record[metric] = float(block[metric].sum() / count)
+        if "feasibility_check" in block.columns:
+            flags = block["feasibility_check"].astype(str).str.strip().str.lower()
+            if not flags.isin(["yes", "no"]).all():
+                raise ValueError("feasibility_check must be Yes or No for every snapshot")
+            feasible_count = int(flags.eq("yes").sum())
+            record["feasible_snapshots"] = feasible_count
+            record["infeasible_snapshots"] = len(block) - feasible_count
+            record["feasibility_rate"] = feasible_count / len(block)
+            # Yes means ALL contributing sets returned feasible selections.
+            record["feasibility_check"] = "Yes" if feasible_count == len(block) else "No"
         output.append(record)
     averages = pd.DataFrame(output).sort_values(["scenario_order", "method"], kind="stable")
     if out_path is not None:
@@ -313,12 +324,13 @@ def make_per_user_records(snapshot, results, methods):
                 method=method, user=int(contribution["user"]),
                 is_candidate_pool=bool(contribution["is_candidate_pool"]),
                 served=bool(contribution["served"]),
-                rf_chain=(next((entry["rf_chain"] for entry in results[method]["table"]
-                                if entry["user"] == u), None)),
+                rf_chain=("|".join(str(entry["rf_chain"]) for entry in results[method]["table"]
+                                   if entry["user"] == u) or None),
                 assigned_beam=contribution["beam"],
                 gain_linear=contribution["gain_linear"],
                 interference_linear=contribution["interference_linear"],
                 fairness=contribution["fairness"],
+                feasibility_check=results[method]["feasibility_check"],
             ))
     return output
 
@@ -401,7 +413,9 @@ def main():
                    f"(20 for two complete sets), NOT per-served-user mean\n"
                    f"optimiser: PennyLane, depth={base.P_DEPTH}, restarts={base.N_RESTARTS}\n"
                    f"measurement shots: {base.SHOTS}\n"
-                   f"candidate shortlist matching feasibility repair: enabled\n")
+                   f"candidate shortlist matching feasibility repair: enabled\n"
+                   f"QAOA_FCN: lowest-energy sampled assignment WITHOUT feasibility filtering; "
+                   f"objective score excludes violation penalties; feasibility Yes only if valid\n")
     rows, per_user_rows, diagnostics = [], [], []
     for snap in snaps:
         i = snap["index"]
@@ -411,11 +425,12 @@ def main():
                             "p_opt": extra["p_opt"], "p_feas": extra["p_feas"],
                             "matches_ilp": extra["qaoa_matches_opt"],
                             "penalties_sufficient": extra["penalties_sufficient"]})
-        for method in base.METHODS:
+        for method in REPORT_METHODS:
             r = results[method]
             base.print_rf_table(method, r["table"])
             print(f"   gain={r['gain_linear']:.6g} | interference={r['interference_linear']:.6g} "
-                  f"| fairness={r['fairness']:.6g} | objective={r['objective_score']:.6g}")
+                  f"| fairness={r['fairness']:.6g} | objective={r['objective_score']:.6g} "
+                  f"| feasible={r['feasibility_check']}")
             rows.append(dict(snapshot=i+1, set=snap["set"], scenario=snap["scenario"],
                              scenario_order=snap["scenario_order"],
                              source_rows=snap["row_count"], model=snap["info"]["channel_model"],
@@ -423,8 +438,10 @@ def main():
                              rf_chains=args.rf, qubits=args.users*args.beams,
                              method=method, gain_linear=r["gain_linear"],
                              interference_linear=r["interference_linear"], fairness=r["fairness"],
-                             objective_score=r["objective_score"]))
-        per_user_rows.extend(make_per_user_records(snap, results, base.METHODS))
+                             objective_score=r["objective_score"],
+                             feasibility_check=r["feasibility_check"],
+                             qubo_energy=r.get("qubo_energy", float("nan"))))
+        per_user_rows.extend(make_per_user_records(snap, results, REPORT_METHODS))
         if not extra["penalties_sufficient"]:
             print("   Warning: fixed QUBO constraint penalties do NOT make the unrestricted "
                   "weight-R ground state feasible for this snapshot; feasibility is enforced "

@@ -1,3 +1,43 @@
+
+## QAOA_FCN (Feasibility Check No) — new fifth result row
+
+The experiment now reports **five rows for each scenario and set**: `Greedy`,
+`OMP`, `QAOA-XY`, `ILP`, `QAOA_FCN`. The latter is NOT an additional quantum
+circuit and does NOT alter any of the four existing algorithms. It uses the
+**same 1024 shots and the same optimized PennyLane circuit** as `QAOA-XY`.
+
+* `QAOA-XY` chooses the lowest-QUBO-energy **feasible** sampled solution;
+  if none of its 1024 samples is feasible, the existing probability-based
+  feasible fallback remains unchanged.
+* `QAOA_FCN` chooses the lowest-QUBO-energy **sampled** solution *without*
+  checking assignment feasibility. This allows repeated users or shared
+  beams, and exposes the effect of post-selection feasibility filtering.
+* `feasibility_check` is `Yes` exactly when the reported assignment has the
+  requested RF-chain cardinality, no repeated users, and no repeated beams;
+  otherwise it is `No`. The flag is recorded for ALL five methods in
+  `qaoa_dataset_results.csv` and `qaoa_per_user_results.csv`.
+* `qaoa_scenario_means.csv` includes the same five methods, their mean
+  physical objective scores and `feasibility_check` (`Yes` only when ALL
+  included snapshots for that method/scenario were feasible), plus
+  `feasible_snapshots`, `infeasible_snapshots`, and `feasibility_rate`.
+* Each snapshot produces 5 result rows; a 20-snapshot run produces **100**
+  snapshot rows and **50** scenario-mean rows. Per-user data has 1000 rows.
+* `objective_score = -1.0 * total_gain + 0.5 * total_interference +
+  0.2 * total_fairness` is computed from physical contributions even for
+  infeasible `QAOA_FCN` selections. `qubo_energy` in that row is the sampled
+  energy **including the QUBO constraint terms**. Thus the physical score
+  for an infeasible FCN selection must NOT be interpreted as a feasible
+  optimization result or compared as if it were an ILP-optimal feasible score.
+* With duplicated users, the per-user CSV combines all selected beams for
+  that user (pipe-separated `assigned_beam`/`rf_chain` fields) and sums their
+  physical contributions. Cross-user interference excludes pairs within
+  the same user, as in the QUBO's physical interference term.
+* The existing **three plots** still show Greedy, OMP, QAOA-XY, and ILP,
+  without adding a fifth trace by default. The fifth row remains available
+  in the stored CSVs for further analysis.
+
+The source-row divide-by-20 scenario aggregation is **unchanged**.
+
 # Beam assignment: exact weighted QUBO + PennyLane XY-QAOA
 
 ## What changed
